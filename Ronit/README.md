@@ -1,7 +1,7 @@
 # ANRF AISEHack Theme 2 — PM2.5 Forecasting
 **Team member:** Ronit  
-**Kaggle username:** kushieboi  
-**Dataset URL:** https://www.kaggle.com/datasets/kushieboi/ronit-pm25-baseline-tfno2d  
+**Kaggle username:** ronitraj1  
+**Dataset URL:** https://www.kaggle.com/datasets/ronitraj1/ronit-pm25-src  
 **Competition:** https://www.kaggle.com/competitions/aisehack-theme-2  
 
 ---
@@ -98,7 +98,7 @@ for block in self.blocks:
 This notebook only **calls** functions from `src/`. It should stay ≤15 cells.  
 The only variable to set in it:
 ```python
-KAGGLE_SRC_DATASET = "ronit-pm25-baseline-tfno2d"   # your dataset slug — already set
+KAGGLE_SRC_DATASET = "ronit-pm25-src"   # your dataset slug — already set
 ```
 
 ---
@@ -106,12 +106,12 @@ KAGGLE_SRC_DATASET = "ronit-pm25-baseline-tfno2d"   # your dataset slug — alre
 ## One-Time Setup (Already Done)
 
 ```bash
-# Kaggle CLI installed in angentgate env
-conda run -n angentgate pip install kaggle
+# Kaggle CLI installed in aisehack env
+conda run -n aisehack pip install kaggle
 
 # Dataset created on Kaggle (already done)
 cd ~/Documents/CODING/Hackathon/ANRF_AISEHack_Code/Ronit
-conda run -n angentgate kaggle datasets create -p . --dir-mode zip
+conda run -n aisehack kaggle datasets create -p . --dir-mode zip
 ```
 
 ---
@@ -125,7 +125,7 @@ conda run -n angentgate kaggle datasets create -p . --dir-mode zip
 cd ~/Documents/CODING/Hackathon/ANRF_AISEHack_Code/Ronit
 
 # 2. Upload new version to Kaggle (run this every time you change any file)
-conda run -n angentgate kaggle datasets version -p . --dir-mode zip -m "describe what you changed"
+conda run -n aisehack kaggle datasets version -p . --dir-mode zip -m "describe what you changed"
 # Examples:
 # -m "add residual skip connections"
 # -m "reduce to 10 features for speed"
@@ -136,15 +136,15 @@ conda run -n angentgate kaggle datasets version -p . --dir-mode zip -m "describe
 
 ```bash
 # Same command — uploads everything including the notebook
-conda run -n angentgate kaggle datasets version -p . --dir-mode zip -m "update notebook cells"
+conda run -n aisehack kaggle datasets version -p . --dir-mode zip -m "update notebook cells"
 ```
 
 ### On Kaggle after uploading
 
-1. Go to https://www.kaggle.com/datasets/kushieboi/ronit-pm25-baseline-tfno2d
+1. Go to https://www.kaggle.com/datasets/ronitraj1/ronit-pm25-src
 2. Confirm the new version is visible
 3. Open your Kaggle notebook
-4. In the **Input** panel (right side) → find `ronit-pm25-baseline-tfno2d` → click **Check for Updates** → accept
+4. In the **Input** panel (right side) → find `ronit-pm25-src` → click **Check for Updates** → accept
 5. Click **Run All** (or Save & Run All for a full commit/submission)
 
 ---
@@ -160,12 +160,12 @@ code ~/Documents/CODING/Hackathon/ANRF_AISEHack_Code/Ronit/src/model.py
 ### Step 2 — Push to Kaggle
 ```bash
 cd ~/Documents/CODING/Hackathon/ANRF_AISEHack_Code/Ronit
-conda run -n angentgate kaggle datasets version -p . --dir-mode zip -m "add residual skip connections in TFNO2D"
+conda run -n aisehack kaggle datasets version -p . --dir-mode zip -m "add residual skip connections in TFNO2D"
 ```
 
 ### Step 3 — Run on Kaggle
 - Open: https://www.kaggle.com/code (your notebook)
-- Input panel → `ronit-pm25-baseline-tfno2d` → Check for Updates
+- Input panel → `ronit-pm25-src` → Check for Updates
 - **Session → Accelerator → GPU P100** (verify this is selected)
 - **Run All**
 - Wait ~4–9 hours depending on config
@@ -177,7 +177,7 @@ conda run -n angentgate kaggle datasets version -p . --dir-mode zip -m "add resi
 ### Step 5 — Save result locally (optional but recommended)
 ```bash
 # Download the preds.npy from your Kaggle notebook output to local
-conda run -n angentgate kaggle kernels output YOUR_NOTEBOOK_SLUG -p ~/Documents/CODING/Hackathon/ANRF_AISEHack_Code/Ronit/outputs/submissions/
+conda run -n aisehack kaggle kernels output YOUR_NOTEBOOK_SLUG -p ~/Documents/CODING/Hackathon/ANRF_AISEHack_Code/Ronit/outputs/submissions/
 ```
 
 ---
@@ -188,7 +188,7 @@ conda run -n angentgate kaggle kernels output YOUR_NOTEBOOK_SLUG -p ~/Documents/
 2. **File → Import Notebook** → upload `notebooks/exp_01_baseline.ipynb`
 3. **Input** (right panel) → **Add Input**:
    - Search **aisehack-theme-2** → Add (competition data)
-  - Search **ronit-pm25-baseline-tfno2d** → Add (your src code)
+  - Search **ronit-pm25-src** → Add (your src code)
 4. **Session → Accelerator → GPU P100**
 5. **Settings → Internet → On** (needed for package installs if any)
 6. Run once to verify everything works
@@ -200,8 +200,8 @@ conda run -n angentgate kaggle kernels output YOUR_NOTEBOOK_SLUG -p ~/Documents/
 | What | Kaggle Path | Saved after run? |
 |------|------------|-----------------|
 | Competition data | `/kaggle/input/competitions/aisehack-theme-2/` | N/A (read-only) |
-| Your src code | `/kaggle/input/ronit-pm25-baseline-tfno2d/src/` | N/A (read-only) |
-| Your config | `/kaggle/input/ronit-pm25-baseline-tfno2d/configs/config.yaml` | N/A (read-only) |
+| Your src code | `/kaggle/input/ronit-pm25-src/src/` | N/A (read-only) |
+| Your config | `/kaggle/input/ronit-pm25-src/configs/config.yaml` | N/A (read-only) |
 | Norm stats | `/kaggle/temp/norm_stats.npy` | ❌ No |
 | Model checkpoint | `/kaggle/temp/best_model.pt` | ❌ No |
 | **Predictions** | `/kaggle/working/preds.npy` | ✅ **Yes — this is submitted** |
@@ -223,29 +223,29 @@ conda run -n angentgate kaggle kernels output YOUR_NOTEBOOK_SLUG -p ~/Documents/
 
 ```bash
 # Activate environment
-conda activate angentgate
+conda activate aisehack
 
 # Upload updated files to Kaggle
 cd ~/Documents/CODING/Hackathon/ANRF_AISEHack_Code/Ronit
-conda run -n angentgate kaggle datasets version -p . --dir-mode zip -m "YOUR MESSAGE HERE"
+conda run -n aisehack kaggle datasets version -p . --dir-mode zip -m "YOUR MESSAGE HERE"
 
 # Check dataset versions on Kaggle
-conda run -n angentgate kaggle datasets status kushieboi/ronit-pm25-baseline-tfno2d
+conda run -n aisehack kaggle datasets status ronitraj1/ronit-pm25-src
 
 # List your Kaggle notebooks
-conda run -n angentgate kaggle kernels list --mine
+conda run -n aisehack kaggle kernels list --mine
 
 # Current baseline kernel slug
-# kushieboi/ronit-pm25-baseline-tfno2d-run
+# ronitraj1/YOUR_NOTEBOOK_SLUG
 
 # Check if a notebook run is complete
-conda run -n angentgate kaggle kernels status YOUR_NOTEBOOK_SLUG
+conda run -n aisehack kaggle kernels status YOUR_NOTEBOOK_SLUG
 
 # Download notebook output (preds.npy) after run
-conda run -n angentgate kaggle kernels output YOUR_NOTEBOOK_SLUG -p ./outputs/submissions/
+conda run -n aisehack kaggle kernels output YOUR_NOTEBOOK_SLUG -p ./outputs/submissions/
 
 # Check leaderboard
-conda run -n angentgate kaggle competitions leaderboard aisehack-theme-2 --show
+conda run -n aisehack kaggle competitions leaderboard aisehack-theme-2 --show
 ```
 
 ---

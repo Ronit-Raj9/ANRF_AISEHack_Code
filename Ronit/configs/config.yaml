@@ -4,7 +4,7 @@
 
 paths:
   # Kaggle paths (used when /kaggle exists)
-  data:       "/kaggle/input/competitions/aisehack-theme-2"
+  data:       "/kaggle/input/datasets/khushisingh942004/aisehack"
   temp:       "/kaggle/temp"
   model_save: "/kaggle/temp/best_model.pt"
   output:     "/kaggle/working/preds.npy"
