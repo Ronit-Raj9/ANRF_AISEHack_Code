@@ -1,0 +1,43 @@
+# ─────────────────────────────────────────────
+# PM2.5 Forecasting — Configuration
+# ─────────────────────────────────────────────
+
+paths:
+  data: "/kaggle/input/competitions/aisehack-theme-2"
+  temp: "/kaggle/temp"
+  model_save: "/kaggle/temp/best_model.pt"
+  output: "/kaggle/working/preds.npy"
+
+features:
+  met: ["u10", "v10", "pblh", "rain", "t2", "q2"]
+  emis: ["PM25", "SO2", "NOx"]
+  # Full feature list = ["cpm25"] + met + emis
+
+time:
+  t_in_cpm: 10       # cpm25 history available at test time
+  t_in_met: 26       # met/emis full input window
+  t_out: 16           # forecast horizon
+  stride_train: 2     # training sample stride
+  stride_val: 4       # validation sample stride
+
+data:
+  months: ["APRIL_16", "JULY_16", "OCT_16", "DEC_16"]
+  val_month: "OCT_16"
+  test_samples: 996
+
+model:
+  width: 64
+  modes: 20
+  depth: 4
+
+training:
+  epochs: 30
+  batch_size_train: 4
+  batch_size_val: 8
+  batch_size_test: 16
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  pct_start: 0.1       # OneCycleLR warmup fraction
+  grad_clip: 1.0
+  num_workers: 2
+  seed: 42
