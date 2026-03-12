@@ -60,11 +60,16 @@ def build_samples(cfg, months, stride, stats):
 
     X_list, y_list = [], []
     for m in months:
-        # Load & normalize
+        # Load & normalize all features (once per month)
         raw = {}
         for feat in features:
             arr = np.load(os.path.join(data_dir, 'raw', m, f'{feat}.npy')).astype(np.float32)
             raw[feat] = (arr - stats[feat]['mean']) / stats[feat]['std']
+
+        # Load raw (physical) cpm25 once per month for targets
+        cpm_raw = np.load(
+            os.path.join(data_dir, 'raw', m, 'cpm25.npy')
+        ).astype(np.float32)
 
         T = raw['cpm25'].shape[0]
 
@@ -78,14 +83,14 @@ def build_samples(cfg, months, stride, stats):
             inp[t_in_cpm:, :, :, 0] = 0.0
 
             # Output: next t_out hours of cpm25 in physical units
-            cpm_raw = np.load(
-                os.path.join(data_dir, 'raw', m, 'cpm25.npy')
-            ).astype(np.float32)
             out_raw = cpm_raw[i + t_in_met : i + t_in_met + t_out]  # (16, 140, 124)
             out = out_raw.transpose(1, 2, 0)  # (140, 124, 16)
 
             X_list.append(inp)
             y_list.append(out)
+
+        del raw, cpm_raw
+        gc.collect()
 
     return np.stack(X_list), np.stack(y_list)
 

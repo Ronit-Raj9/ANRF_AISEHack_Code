@@ -29,4 +29,18 @@ def load_config(config_path: str = None) -> dict:
         m for m in cfg['data']['months'] if m != cfg['data']['val_month']
     ]
 
+    # Override paths when running locally (kaggle dirs don't exist)
+    import os as _os
+    if not _os.path.exists('/kaggle'):
+        local_out = _os.path.abspath(
+            _os.path.join(_os.path.dirname(__file__), '..', 'outputs')
+        )
+        cfg['paths']['temp']       = _os.path.join(local_out, 'models')
+        cfg['paths']['model_save'] = _os.path.join(local_out, 'models', 'best_model.pt')
+        cfg['paths']['output']     = _os.path.join(local_out, 'submissions', 'preds.npy')
+        _os.makedirs(cfg['paths']['temp'], exist_ok=True)
+        _os.makedirs(_os.path.join(local_out, 'submissions'), exist_ok=True)
+    else:
+        _os.makedirs(cfg['paths']['temp'], exist_ok=True)
+
     return cfg

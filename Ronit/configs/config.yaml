@@ -9,9 +9,9 @@ paths:
   output: "/kaggle/working/preds.npy"
 
 features:
-  met: ["u10", "v10", "pblh", "rain", "t2", "q2"]
-  emis: ["PM25", "SO2", "NOx"]
-  # Full feature list = ["cpm25"] + met + emis
+  met: ["u10", "v10", "pblh", "rain", "t2", "q2", "swdown", "psfc"]
+  emis: ["PM25", "SO2", "NOx", "NH3", "NMVOC_e", "NMVOC_finn", "bio"]
+  # Full feature list = ["cpm25"] + met + emis  →  16 features total
 
 time:
   t_in_cpm: 10       # cpm25 history available at test time
