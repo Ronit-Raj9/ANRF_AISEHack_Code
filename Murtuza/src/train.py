@@ -76,13 +76,24 @@ def get_optimizer(cfg, model, steps_per_epoch):
         lr           = cfg['training']['lr'],
         weight_decay = cfg['training']['weight_decay'],
     )
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr           = cfg['training']['lr'],
-        steps_per_epoch  = steps_per_epoch,
-        epochs           = cfg['training']['epochs'],
-        pct_start        = cfg['training']['pct_start'],
-    )
+    sched_type = cfg['training'].get('scheduler', 'coswr')
+    if sched_type == 'onecycle':
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr           = cfg['training']['lr'],
+            steps_per_epoch  = steps_per_epoch,
+            epochs           = cfg['training']['epochs'],
+            pct_start        = cfg['training']['pct_start'],
+        )
+    else:  # 'coswr' — Cosine Annealing with Warm Restarts
+        T_0    = max(1, steps_per_epoch * cfg['training'].get('t0_epochs', 10))
+        T_mult = cfg['training'].get('t_mult', 2)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0    = T_0,
+            T_mult = T_mult,
+            eta_min = cfg['training']['lr'] * 1e-2,  # floor = 1% of initial LR
+        )
     return optimizer, scheduler
 
 # ─────────────────────────────────────────────

@@ -62,14 +62,17 @@ models:
     dropout: 0.05
 
 training:
-  epochs:           60
-  patience:         8          # early-stopping epochs without val improvement
+  epochs:           80
+  patience:         12         # early-stopping epochs without val improvement
   batch_size_train: 4
   batch_size_val:   8
   batch_size_test:  16
-  lr:               3.0e-4
+  lr:               6.0e-4
   weight_decay:     1.0e-3
-  pct_start:        0.1        # OneCycleLR warmup fraction
+  pct_start:        0.1        # OneCycleLR warmup fraction (unused by coswr)
+  scheduler:        "coswr"    # cosine warm restarts; use "onecycle" to revert
+  t0_epochs:        10         # CosWR: restart period in epochs
+  t_mult:           2          # CosWR: period doubling factor (10→20→40 epochs)
   grad_clip:        1.0
   num_workers:      2
   pin_memory:       true
