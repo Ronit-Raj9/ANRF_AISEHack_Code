@@ -7,16 +7,17 @@ paths:
   data:       "/kaggle/input/datasets/khushisingh942004/aisehack"
   temp:       "/kaggle/temp"
   model_save: "/kaggle/temp/best_model.pt"
+  checkpoint_dir: "/kaggle/temp/checkpoints"
+  checkpoint_last: "/kaggle/temp/checkpoints/last_checkpoint.pt"
   output:     "/kaggle/working/preds.npy"
   # Local paths (auto-applied in config.py when not on Kaggle)
   data_local: "/home/raj/Documents/CODING/Hackathon/ANRF_AISEHack_Code/aisehack-theme-2"
 
 features:
-  met:  ["u10", "v10", "pblh", "rain", "t2", "q2"]
-  emis: ["PM25"]
-  aux:  ["lat", "lon", "hour_sin", "hour_cos", "doy_sin", "doy_cos"]
-  use_aux: false
-  # Feature list = ["cpm25"] + met + emis  →  8 features total
+  met:  ["pblh", "t2", "u10", "v10", "q2", "rain"]
+  emis: ["PM25", "NOx"]
+  aux:  ["hour_sin", "hour_cos"]
+  use_aux: true
 
 time:
   t_in_cpm: 10    # cpm25 history hours available at test time
@@ -31,9 +32,13 @@ data:
   test_samples: 996
 
 preprocessing:
-  cpm25_log1p: true
-  cpm25_grid_zscore: true
-  cpm25_grid_eps: 1.0e-6
+  normalization: grid_log_standardize
+  use_mmap: true
+  grid_chunk_size: 48
+  grid_stats_filename: grid_log_scaler_2016.npz
+  grid_stats_eps: 1.0e-6
+  auto_build_grid_stats: true
+  signed_log_for_negative: true
 
 # ── Persistence baseline (from EDA) — values in *normalized* [0,1] space ──
 persistence:
@@ -41,19 +46,13 @@ persistence:
   rmse_physical:   30.83    # µg/m³  (threshold model must beat)
 
 model:
-  type:    "res_stunet"  # advanced run primary model
-  # U-Net settings
-  base_ch: 96
-  # TFNO2D settings (fallback)
+  type:    "physics_frno"
   width:   64
   modes:   20
   depth:   6
-  # Residual spatiotemporal U-Net settings
-  stem_ch: 64
-  dropout: 0.12
-  drop_path: 0.08
-  use_se: true
-  use_context_pyramid: true
+  rank_ratio: 0.4
+  alpha_init: 0.35
+  dropout: 0.05
 
 models:
   tfno2d:
@@ -62,18 +61,21 @@ models:
     depth: 6
   unet:
     base_ch: 64
-  res_stunet:
-    base_ch: 96
-    stem_ch: 64
-    dropout: 0.12
-    drop_path: 0.08
-    use_se: true
-    use_context_pyramid: true
+  physics_frno:
+    width: 64
+    modes: 20
+    depth: 6
+    rank_ratio: 0.4
+    alpha_init: 0.35
+    dropout: 0.05
 
 training:
-  epochs:           100
-  patience:         15         # early-stopping epochs without val improvement
-  batch_size_train: 4
+  phase1_epochs:    20
+  phase2_epochs:    20
+  phase3_epochs:    10
+  epochs:           50
+  patience:         12
+  batch_size_train: 8
   batch_size_val:   8
   batch_size_test:  16
   lr:               5.0e-4
@@ -84,10 +86,17 @@ training:
   pin_memory:       true
   seed:             42
   use_amp:          true
+  lambda_d:         1.0
+  lambda_p:         0.02
   use_weighted_sampler: true
   default_sampling_weight: 1.0
-  checkpoint_metric: mixed
-  checkpoint_mixed_alpha: 0.7
+  checkpoint_metric: val_rmse_phys
+  enable_checkpointing: true
+  checkpoint_every_epochs: 5
+  resume_if_available: true
+  resume_checkpoint_path: ""
+  checkpoint_mixed_alpha: 0.5
+  phase3_detach_feedback: false
   month_sampling_weights:
     APRIL_16: 0.5
     JULY_16: 0.5
@@ -95,21 +104,19 @@ training:
     DEC_16: 2.0
 
 loss:
-  type: log_rmse
-  horizon_weight_min: 0.8
-  horizon_weight_max: 1.4
-  rmse_weight: 0.8
-  mae_weight: 0.2
-  intensity_weighted: true
-  intensity_alpha: 1.5
-  intensity_ref: 59.0
-  intensity_cap: 3.0
-  phase_switch_epoch: 20
-  phase2_mode: weighted_mae_phys
+  type: three_phase
+  intensity_ref: 59.1
+
+physics:
+  enabled: true
+  diffusivity: 0.05
+  source_weight: 0.0
+  epsilon: 1.0e-8
 
 inference:
   use_tta: true
-  tta_modes: ["identity", "hflip", "vflip", "hvflip"]
+  use_autoregressive: true
+  tta_modes: ["identity", "hflip", "vflip"]
   model_paths: []
 
 # ── Weights & Biases ──────────────────────────────────────────────────────────
@@ -119,7 +126,7 @@ wandb:
   project: "aisehack"
   # Leave run_name blank to auto-generate
   run_name: ""
-  tags:     ["pm25", "spatiotemporal", "aisehack"]
+  tags:     ["pm25", "frno", "physics", "aisehack"]
   # Log the best checkpoint as a W&B artifact
   log_model: true
   # How often (epochs) to log per-horizon RMSE heatmap

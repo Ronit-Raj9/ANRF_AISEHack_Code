@@ -491,6 +491,201 @@ class TFNO2D(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Physics-informed Tucker FrNO
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _FractionalPhaseRotation(nn.Module):
+    """Learnable fractional phase rotation over retained Fourier modes."""
+
+    def __init__(self, modes1: int, modes2: int, alpha_init: float = 0.35):
+        super().__init__()
+        self.modes1 = modes1
+        self.modes2 = modes2
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+
+        ky = torch.linspace(0.0, 1.0, modes1).view(modes1, 1)
+        kx = torch.linspace(0.0, 1.0, modes2).view(1, modes2)
+        self.register_buffer('phase_grid', ky + kx)
+
+    def forward(self, x_ft: torch.Tensor, sign: float = 1.0) -> torch.Tensor:
+        phase = torch.exp(1j * sign * self.alpha * self.phase_grid.to(device=x_ft.device))
+        return x_ft * phase[None, None]
+
+
+class _TuckerSpectralKernel2d(nn.Module):
+    """Low-rank Tucker parameterization of complex spectral weights."""
+
+    def __init__(self, in_ch: int, out_ch: int, modes1: int, modes2: int, rank_ratio: float = 0.4):
+        super().__init__()
+        r_in = max(4, int(round(in_ch * rank_ratio)))
+        r_out = max(4, int(round(out_ch * rank_ratio)))
+        r1 = max(4, int(round(modes1 * rank_ratio)))
+        r2 = max(4, int(round(modes2 * rank_ratio)))
+        scale = 1.0 / max(1, in_ch * out_ch)
+
+        self.in_factor = nn.Parameter(scale * torch.randn(in_ch, r_in))
+        self.out_factor = nn.Parameter(scale * torch.randn(out_ch, r_out))
+        self.m1_factor = nn.Parameter(scale * torch.randn(modes1, r1))
+        self.m2_factor = nn.Parameter(scale * torch.randn(modes2, r2))
+        self.core_pos = nn.Parameter(scale * torch.randn(r_in, r_out, r1, r2, dtype=torch.cfloat))
+        self.core_neg = nn.Parameter(scale * torch.randn(r_in, r_out, r1, r2, dtype=torch.cfloat))
+
+    def reconstruct(self, positive: bool = True) -> torch.Tensor:
+        core = self.core_pos if positive else self.core_neg
+        return torch.einsum(
+            'ia,ob,xc,yd,abcd->ioxy',
+            self.in_factor.to(dtype=core.real.dtype),
+            self.out_factor.to(dtype=core.real.dtype),
+            self.m1_factor.to(dtype=core.real.dtype),
+            self.m2_factor.to(dtype=core.real.dtype),
+            core,
+        )
+
+
+class _TuckerFrSpectralConv2d(nn.Module):
+    """Tucker-factorized spectral convolution with learnable fractional phase rotation."""
+
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        modes1: int,
+        modes2: int,
+        rank_ratio: float = 0.4,
+        alpha_init: float = 0.35,
+    ):
+        super().__init__()
+        self.modes1 = modes1
+        self.modes2 = modes2
+        self.rotation = _FractionalPhaseRotation(modes1, modes2, alpha_init=alpha_init)
+        self.kernel = _TuckerSpectralKernel2d(in_ch, out_ch, modes1, modes2, rank_ratio=rank_ratio)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, _, H, W = x.shape
+        x_ft = torch.fft.rfft2(x, norm='ortho')
+        out_ft = torch.zeros(
+            B,
+            self.kernel.out_factor.shape[0],
+            H,
+            W // 2 + 1,
+            dtype=torch.cfloat,
+            device=x.device,
+        )
+
+        pos = self.rotation(x_ft[:, :, :self.modes1, :self.modes2], sign=1.0)
+        neg = self.rotation(x_ft[:, :, -self.modes1:, :self.modes2], sign=-1.0)
+        w_pos = self.kernel.reconstruct(positive=True).to(device=x.device)
+        w_neg = self.kernel.reconstruct(positive=False).to(device=x.device)
+
+        out_ft[:, :, :self.modes1, :self.modes2] = torch.einsum('bixy,ioxy->boxy', pos, w_pos)
+        out_ft[:, :, -self.modes1:, :self.modes2] = torch.einsum('bixy,ioxy->boxy', neg, w_neg)
+        return torch.fft.irfft2(out_ft, s=(H, W), norm='ortho')
+
+
+class _FrNOBlock(nn.Module):
+    def __init__(self, width: int, modes: int, rank_ratio: float = 0.4, alpha_init: float = 0.35, dropout: float = 0.0):
+        super().__init__()
+        self.spectral = _TuckerFrSpectralConv2d(width, width, modes, modes, rank_ratio=rank_ratio, alpha_init=alpha_init)
+        self.bypass = nn.Conv2d(width, width, 1)
+        groups = min(8, width)
+        while width % groups != 0 and groups > 1:
+            groups -= 1
+        self.norm = nn.GroupNorm(groups, width)
+        self.ffn = nn.Sequential(
+            nn.Conv2d(width, width * 2, 1),
+            nn.GELU(),
+            nn.Dropout2d(dropout) if dropout > 0 else nn.Identity(),
+            nn.Conv2d(width * 2, width, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = F.gelu(self.norm(self.spectral(x) + self.bypass(x)))
+        return x + self.ffn(z)
+
+
+class PhysicsFrNO(nn.Module):
+    """
+    Physics-informed Tucker-factorized fractional residual neural operator.
+
+    Key mechanics:
+    - grid-standardized log-domain learning
+    - Tucker-factorized spectral blocks with learnable fractional phase rotation
+    - residual persistence head anchored to the last observed cpm25 field
+    - optional autoregressive rollout for phase-3 fine-tuning / inference
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        t_in: int,
+        t_in_cpm: int = 10,
+        out_steps: int = 16,
+        width: int = 64,
+        modes: int = 20,
+        depth: int = 6,
+        rank_ratio: float = 0.4,
+        alpha_init: float = 0.35,
+        dropout: float = 0.05,
+    ):
+        super().__init__()
+        self.t_in = t_in
+        self.t_in_cpm = t_in_cpm
+        self.out_steps = out_steps
+        self.input_proj = nn.Conv2d(in_channels * t_in, width, 1)
+        self.blocks = nn.ModuleList([
+            _FrNOBlock(width, modes, rank_ratio=rank_ratio, alpha_init=alpha_init, dropout=dropout)
+            for _ in range(depth)
+        ])
+        self.step_embed = nn.Embedding(out_steps, width)
+        self.condition = nn.Sequential(
+            nn.Conv2d(width, width, 1),
+            nn.GELU(),
+            nn.Conv2d(width, width, 1),
+        )
+        self.head = nn.Sequential(
+            nn.Conv2d(width, width, 1),
+            nn.GELU(),
+            nn.Conv2d(width, 1, 1),
+        )
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, T, H, W = x.shape
+        z = self.input_proj(x.reshape(B, C * T, H, W))
+        for block in self.blocks:
+            z = block(z)
+        return z
+
+    def _predict_from_latent(self, latent: torch.Tensor, anchor: torch.Tensor, step_idx: int | torch.Tensor) -> torch.Tensor:
+        if not torch.is_tensor(step_idx):
+            step_idx = torch.full((latent.shape[0],), int(step_idx), device=latent.device, dtype=torch.long)
+        emb = self.step_embed(step_idx).view(latent.shape[0], -1, 1, 1)
+        cond = self.condition(latent + emb)
+        delta = self.head(cond).squeeze(1)
+        return delta + anchor
+
+    def forward_parallel(self, x: torch.Tensor) -> torch.Tensor:
+        anchor = x[:, 0, self.t_in_cpm - 1]
+        latent = self.encode(x)
+        preds = [self._predict_from_latent(latent, anchor, step_idx=s) for s in range(self.out_steps)]
+        return torch.stack(preds, dim=-1)
+
+    def rollout(self, x: torch.Tensor, detach_feedback: bool = False) -> torch.Tensor:
+        anchor = x[:, 0, self.t_in_cpm - 1]
+        state = x.clone()
+        preds = []
+        for step in range(self.out_steps):
+            latent = self.encode(state)
+            pred = self._predict_from_latent(latent, anchor, step_idx=step)
+            preds.append(pred)
+            if step < self.out_steps - 1:
+                state[:, 0, self.t_in_cpm + step] = pred.detach() if detach_feedback else pred
+        return torch.stack(preds, dim=-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_parallel(x)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Registry / Factory
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -499,6 +694,8 @@ MODEL_REGISTRY = {
     'tfno2d': TFNO2D,
     'fno2d': TFNO2D,
     'res_stunet': ResidualSTUNet,
+    'physics_frno': PhysicsFrNO,
+    'frno': PhysicsFrNO,
 }
 
 
@@ -552,6 +749,19 @@ def build_model(cfg) -> nn.Module:
             drop_path = cfg['model'].get('drop_path', 0.03),
             use_se = cfg['model'].get('use_se', True),
             use_context_pyramid = cfg['model'].get('use_context_pyramid', True),
+        )
+    elif mtype in ('physics_frno', 'frno'):
+        model = MODEL_REGISTRY[mtype](
+            in_channels = input_channels,
+            t_in = t_in_met,
+            t_in_cpm = t_in_cpm,
+            out_steps = t_out,
+            width = cfg['model'].get('width', 64),
+            modes = cfg['model'].get('modes', 20),
+            depth = cfg['model'].get('depth', 6),
+            rank_ratio = cfg['model'].get('rank_ratio', 0.4),
+            alpha_init = cfg['model'].get('alpha_init', 0.35),
+            dropout = cfg['model'].get('dropout', 0.05),
         )
 
     return model.to(cfg['device'])
