@@ -29,7 +29,11 @@ def main() -> None:
         stats = load_grid_stats(cfg)
 
     print(f"Saved grid scaler: {cfg['paths']['grid_stats']}")
-    describe_grid_stats(stats, cfg['features']['base'])
+    standardized = [
+        feat for feat in cfg['features']['input']
+        if feat in cfg['features']['base'] or feat in cfg['preprocessing'].get('aux_standardize_features', [])
+    ]
+    describe_grid_stats(stats, standardized)
 
 
 if __name__ == '__main__':

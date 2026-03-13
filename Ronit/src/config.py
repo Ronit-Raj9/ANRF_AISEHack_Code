@@ -57,15 +57,7 @@ def load_config(config_path: str = None) -> dict:
     cfg.setdefault('model', {})
     cfg.setdefault('paths', {})
     cfg.setdefault('features', {})
-
-    # Derived feature lists
-    cfg['features']['all'] = ['cpm25'] + cfg['features']['met'] + cfg['features']['emis']
-    cfg['features']['base'] = list(cfg['features']['all'])
-    use_aux = bool(cfg['features'].get('use_aux', False))
-    cfg['features']['aux'] = list(cfg['features'].get('aux', [])) if use_aux else []
-    cfg['features']['input'] = cfg['features']['base'] + cfg['features']['aux']
-    cfg['features']['n_features'] = len(cfg['features']['base'])
-    cfg['features']['input_channels'] = len(cfg['features']['input'])
+    cfg.setdefault('loss', {})
 
     # Modern preprocessing defaults
     cfg['preprocessing'].setdefault('normalization', 'grid_log_standardize')
@@ -75,6 +67,35 @@ def load_config(config_path: str = None) -> dict:
     cfg['preprocessing'].setdefault('grid_stats_eps', 1.0e-6)
     cfg['preprocessing'].setdefault('auto_build_grid_stats', True)
     cfg['preprocessing'].setdefault('signed_log_for_negative', True)
+    cfg['preprocessing'].setdefault('log_eps', 1.0e-12)
+    cfg['preprocessing'].setdefault('log1p_features', ['cpm25', 'rain', 'ventilation_index'])
+    cfg['preprocessing'].setdefault('log_eps_features', ['PM25', 'SO2', 'NOx', 'NH3', 'NMVOC_e', 'NMVOC_finn', 'bio'])
+    cfg['preprocessing'].setdefault('signed_log_features', ['u10', 'v10', 'wind_convergence'])
+    cfg['preprocessing'].setdefault('sparse_mask_features', ['rain', 'NMVOC_finn'])
+    cfg['preprocessing'].setdefault('sparse_mask_threshold', 0.0)
+    cfg['preprocessing'].setdefault('aux_standardize_features', ['ventilation_index', 'wind_convergence'])
+    cfg['preprocessing'].setdefault('derived_features', ['ventilation_index', 'wind_convergence'])
+    cfg['preprocessing'].setdefault('add_land_mask', False)
+    cfg['preprocessing'].setdefault('land_mask_file', '')
+
+    # Derived feature lists
+    cfg['features']['all'] = ['cpm25'] + cfg['features']['met'] + cfg['features']['emis']
+    cfg['features']['base'] = list(cfg['features']['all'])
+    use_aux = bool(cfg['features'].get('use_aux', False))
+    cfg['features']['aux'] = list(cfg['features'].get('aux', [])) if use_aux else []
+    if use_aux:
+        if bool(cfg['preprocessing'].get('add_land_mask', False)) and 'land_mask' not in cfg['features']['aux']:
+            cfg['features']['aux'].append('land_mask')
+        for name in cfg['preprocessing'].get('derived_features', []):
+            if name not in cfg['features']['aux']:
+                cfg['features']['aux'].append(name)
+        for feat in cfg['preprocessing'].get('sparse_mask_features', []):
+            mask_name = f"{feat}_mask"
+            if mask_name not in cfg['features']['aux']:
+                cfg['features']['aux'].append(mask_name)
+    cfg['features']['input'] = cfg['features']['base'] + cfg['features']['aux']
+    cfg['features']['n_features'] = len(cfg['features']['base'])
+    cfg['features']['input_channels'] = len(cfg['features']['input'])
 
     # Backward-compatible aliases
     if cfg['preprocessing'].get('cpm25_grid_zscore', False):
@@ -138,6 +159,10 @@ def load_config(config_path: str = None) -> dict:
     cfg['training'].setdefault('checkpoint_every_epochs', 5)
     cfg['training'].setdefault('resume_if_available', True)
     cfg['training'].setdefault('resume_checkpoint_path', '')
+    cfg['loss'].setdefault('phase3_smooth', 'huber')
+    cfg['loss'].setdefault('huber_delta', 25.0)
+
+    cfg['preprocessing'].setdefault('feature_time_limits', {'cpm25': cfg['time']['t_in_cpm']})
 
     # Inference defaults
     cfg['inference'].setdefault('use_autoregressive', True)

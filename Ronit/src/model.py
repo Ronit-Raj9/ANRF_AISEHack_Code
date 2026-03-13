@@ -603,6 +603,97 @@ class _FrNOBlock(nn.Module):
         return x + self.ffn(z)
 
 
+class _TemporalProjector(nn.Module):
+    """Temporal 3D encoder that collapses time into 2D feature maps."""
+
+    def __init__(self, in_ch: int, out_ch: int, dropout: float = 0.0):
+        super().__init__()
+        groups = min(8, out_ch)
+        while out_ch % groups != 0 and groups > 1:
+            groups -= 1
+        self.block = nn.Sequential(
+            nn.Conv3d(in_ch, out_ch, kernel_size=(3, 3, 3), padding=1, bias=False),
+            nn.GroupNorm(groups, out_ch),
+            nn.GELU(),
+            nn.Dropout3d(dropout) if dropout > 0 else nn.Identity(),
+            nn.Conv3d(out_ch, out_ch, kernel_size=(3, 3, 3), padding=1, bias=False),
+            nn.GroupNorm(groups, out_ch),
+            nn.GELU(),
+        )
+        self.proj = nn.Conv3d(in_ch, out_ch, kernel_size=1, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.block(x) + self.proj(x)
+        return z.mean(dim=2)
+
+
+class _CrossAttentionFusion2d(nn.Module):
+    """Cross-attention fusion: PM state queries met/emission forcing."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        hidden = max(16, channels // 2)
+        self.q = nn.Conv2d(channels, hidden, 1, bias=False)
+        self.k = nn.Conv2d(channels, hidden, 1, bias=False)
+        self.v = nn.Conv2d(channels, channels, 1, bias=False)
+        self.mix = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, 1, bias=False),
+            nn.GELU(),
+        )
+
+    def forward(self, state_feat: torch.Tensor, forcing_feat: torch.Tensor) -> torch.Tensor:
+        q = self.q(state_feat)
+        k = self.k(forcing_feat)
+        score = torch.sum(q * k, dim=1, keepdim=True) / (q.shape[1] ** 0.5)
+        gate = torch.sigmoid(score)
+        attended_forcing = self.v(forcing_feat) * gate
+        return self.mix(torch.cat([state_feat, attended_forcing], dim=1))
+
+
+class _LocalHotspotBlock(nn.Module):
+    """Local-window style spatial refinement block for hotspot sharpening."""
+
+    def __init__(self, channels: int, kernel_size: int = 11, dropout: float = 0.0):
+        super().__init__()
+        pad = kernel_size // 2
+        groups = min(8, channels)
+        while channels % groups != 0 and groups > 1:
+            groups -= 1
+        self.dw = nn.Conv2d(channels, channels, kernel_size, padding=pad, groups=channels, bias=False)
+        self.pw = nn.Conv2d(channels, channels, 1, bias=False)
+        self.norm = nn.GroupNorm(groups, channels)
+        self.drop = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.pw(self.dw(x))
+        z = self.drop(F.gelu(self.norm(z)))
+        return x + z
+
+
+class _HorizonHeadBank(nn.Module):
+    """Specialized output heads for near/mid/long/horizon forecast windows."""
+
+    def __init__(self, channels: int, out_steps: int):
+        super().__init__()
+        self.out_steps = out_steps
+        q, r = divmod(out_steps, 4)
+        sizes = [q, q, q, q + r]
+        self.sizes = sizes
+        self.heads = nn.ModuleList()
+        for size in sizes:
+            self.heads.append(
+                nn.Sequential(
+                    nn.Conv2d(channels, channels, 1),
+                    nn.GELU(),
+                    nn.Conv2d(channels, size, 1),
+                )
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        chunks = [head(x) for head in self.heads]
+        return torch.cat(chunks, dim=1)
+
+
 class PhysicsFrNO(nn.Module):
     """
     Physics-informed Tucker-factorized fractional residual neural operator.
@@ -631,45 +722,86 @@ class PhysicsFrNO(nn.Module):
         self.t_in = t_in
         self.t_in_cpm = t_in_cpm
         self.out_steps = out_steps
-        self.input_proj = nn.Conv2d(in_channels * t_in, width, 1)
-        self.blocks = nn.ModuleList([
+        self.width = width
+
+        forcing_channels = max(1, in_channels - 1)
+        self.state_encoder = _TemporalProjector(1, width, dropout=dropout)
+        self.forcing_encoder = _TemporalProjector(forcing_channels, width, dropout=dropout)
+        self.cross_fusion = _CrossAttentionFusion2d(width)
+
+        self.local_blocks = nn.ModuleList([
+            _LocalHotspotBlock(width, kernel_size=11, dropout=dropout * 0.5),
+            _LocalHotspotBlock(width, kernel_size=7, dropout=dropout * 0.5),
+        ])
+        self.global_blocks = nn.ModuleList([
             _FrNOBlock(width, modes, rank_ratio=rank_ratio, alpha_init=alpha_init, dropout=dropout)
             for _ in range(depth)
         ])
-        self.step_embed = nn.Embedding(out_steps, width)
-        self.condition = nn.Sequential(
+        self.merge = nn.Sequential(
             nn.Conv2d(width, width, 1),
             nn.GELU(),
             nn.Conv2d(width, width, 1),
         )
-        self.head = nn.Sequential(
+
+        self.step_embed = nn.Embedding(out_steps, width)
+        self.step_condition = nn.Sequential(
+            nn.Conv2d(width, width, 1),
+            nn.GELU(),
+            nn.Conv2d(width, width, 1),
+        )
+        self.delta_head = nn.Sequential(
             nn.Conv2d(width, width, 1),
             nn.GELU(),
             nn.Conv2d(width, 1, 1),
         )
+        self.horizon_heads = _HorizonHeadBank(width, out_steps)
+        self.horizon_bias = nn.Parameter(torch.zeros(1, out_steps, 1, 1))
+
+    @staticmethod
+    def _reflect_pad_input(x: torch.Tensor, pad_h: int = 4, pad_w: int = 4) -> tuple[torch.Tensor, tuple[int, int]]:
+        """Reflect-pad (140,124) -> (144,128) by default for FNO boundary alignment."""
+        H0, W0 = x.shape[-2], x.shape[-1]
+        if pad_h > 0 or pad_w > 0:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
+        return x, (H0, W0)
+
+    @staticmethod
+    def _crop_output(y: torch.Tensor, spatial_shape: tuple[int, int]) -> torch.Tensor:
+        H0, W0 = spatial_shape
+        return y[:, :H0, :W0, :]
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, T, H, W = x.shape
-        z = self.input_proj(x.reshape(B, C * T, H, W))
-        for block in self.blocks:
+        x_state = x[:, :1, :self.t_in_cpm]
+        x_forcing = x[:, 1:, :self.t_in]
+        state_feat = self.state_encoder(x_state)
+        forcing_feat = self.forcing_encoder(x_forcing)
+        z = self.cross_fusion(state_feat, forcing_feat)
+
+        for block in self.local_blocks:
             z = block(z)
-        return z
+        for block in self.global_blocks:
+            z = block(z)
+        return self.merge(z)
 
     def _predict_from_latent(self, latent: torch.Tensor, anchor: torch.Tensor, step_idx: int | torch.Tensor) -> torch.Tensor:
         if not torch.is_tensor(step_idx):
             step_idx = torch.full((latent.shape[0],), int(step_idx), device=latent.device, dtype=torch.long)
         emb = self.step_embed(step_idx).view(latent.shape[0], -1, 1, 1)
-        cond = self.condition(latent + emb)
-        delta = self.head(cond).squeeze(1)
+        cond = self.step_condition(latent + emb)
+        delta = self.delta_head(cond).squeeze(1)
         return delta + anchor
 
     def forward_parallel(self, x: torch.Tensor) -> torch.Tensor:
+        x, orig_shape = self._reflect_pad_input(x)
         anchor = x[:, 0, self.t_in_cpm - 1]
         latent = self.encode(x)
-        preds = [self._predict_from_latent(latent, anchor, step_idx=s) for s in range(self.out_steps)]
-        return torch.stack(preds, dim=-1)
+        coarse = self.horizon_heads(latent) + self.horizon_bias
+        persistence = anchor[..., None].repeat(1, 1, 1, self.out_steps)
+        out = coarse.permute(0, 2, 3, 1) + persistence
+        return self._crop_output(out, orig_shape)
 
     def rollout(self, x: torch.Tensor, detach_feedback: bool = False) -> torch.Tensor:
+        x, orig_shape = self._reflect_pad_input(x)
         anchor = x[:, 0, self.t_in_cpm - 1]
         state = x.clone()
         preds = []
@@ -679,7 +811,8 @@ class PhysicsFrNO(nn.Module):
             preds.append(pred)
             if step < self.out_steps - 1:
                 state[:, 0, self.t_in_cpm + step] = pred.detach() if detach_feedback else pred
-        return torch.stack(preds, dim=-1)
+        out = torch.stack(preds, dim=-1)
+        return self._crop_output(out, orig_shape)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_parallel(x)

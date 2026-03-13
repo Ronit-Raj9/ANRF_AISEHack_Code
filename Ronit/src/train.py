@@ -240,6 +240,25 @@ def weighted_mae_phys_loss(pred: torch.Tensor, target: torch.Tensor, cfg: dict, 
     return torch.mean(torch.abs(pred_phys - target_phys) * weights)
 
 
+def smooth_tail_loss(pred: torch.Tensor, target: torch.Tensor, cfg: dict, bounds: dict | None) -> torch.Tensor:
+    mode = str(cfg.get('loss', {}).get('phase3_smooth', 'huber')).lower()
+    if bounds is None or 'cpm25' not in bounds:
+        err = pred - target
+    else:
+        pred_phys = _normalized_to_physical_domain(pred, cfg, bounds)
+        target_phys = _normalized_to_physical_domain(target, cfg, bounds)
+        err = pred_phys - target_phys
+
+    if mode == 'logcosh':
+        return torch.mean(torch.log(torch.cosh(err + 1e-12)))
+
+    delta = float(cfg.get('loss', {}).get('huber_delta', 25.0))
+    abs_err = torch.abs(err)
+    quad = torch.minimum(abs_err, torch.tensor(delta, device=err.device, dtype=err.dtype))
+    lin = abs_err - quad
+    return torch.mean(0.5 * quad * quad + delta * lin)
+
+
 def current_phase(epoch_idx: int, cfg: dict) -> str:
     p1 = int(cfg['training'].get('phase1_epochs', 20))
     p2 = int(cfg['training'].get('phase2_epochs', 20))
@@ -254,7 +273,9 @@ def objective_loss(pred: torch.Tensor, target: torch.Tensor, cfg: dict, bounds: 
     phase = current_phase(epoch_idx, cfg)
     if phase == 'phase1_global_stability':
         return mse_loss(pred, target)
-    return weighted_mae_phys_loss(pred, target, cfg, bounds)
+    if phase == 'phase2_tail_sharpening':
+        return weighted_mae_phys_loss(pred, target, cfg, bounds)
+    return smooth_tail_loss(pred, target, cfg, bounds)
 
 
 def get_optimizer(cfg, model, steps_per_epoch):

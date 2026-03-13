@@ -16,7 +16,7 @@ paths:
 features:
   met:  ["pblh", "t2", "u10", "v10", "q2", "rain"]
   emis: ["PM25", "NOx"]
-  aux:  ["hour_sin", "hour_cos"]
+  aux:  ["hour_sin", "hour_cos", "ventilation_index", "wind_convergence", "rain_mask", "land_mask"]
   use_aux: true
 
 time:
@@ -39,6 +39,18 @@ preprocessing:
   grid_stats_eps: 1.0e-6
   auto_build_grid_stats: true
   signed_log_for_negative: true
+  log_eps: 1.0e-12
+  log1p_features: ["cpm25", "rain", "ventilation_index"]
+  log_eps_features: ["PM25", "SO2", "NOx", "NH3", "NMVOC_e", "NMVOC_finn", "bio"]
+  signed_log_features: ["u10", "v10", "wind_convergence"]
+  sparse_mask_features: ["rain", "NMVOC_finn"]
+  sparse_mask_threshold: 0.0
+  aux_standardize_features: ["ventilation_index", "wind_convergence"]
+  derived_features: ["ventilation_index", "wind_convergence"]
+  add_land_mask: true
+  land_mask_file: ""
+  feature_time_limits:
+    cpm25: 10
 
 # ── Persistence baseline (from EDA) — values in *normalized* [0,1] space ──
 persistence:
