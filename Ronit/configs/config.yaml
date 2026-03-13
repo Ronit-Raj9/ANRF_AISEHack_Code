@@ -12,11 +12,11 @@ paths:
   data_local: "/home/raj/Documents/CODING/Hackathon/ANRF_AISEHack_Code/aisehack-theme-2"
 
 features:
-  met:  ["u10", "v10", "pblh", "rain", "t2", "q2", "swdown", "psfc"]
-  emis: ["PM25", "SO2", "NOx", "NH3", "NMVOC_e", "NMVOC_finn", "bio"]
+  met:  ["u10", "v10", "pblh", "rain", "t2", "q2"]
+  emis: ["PM25"]
   aux:  ["lat", "lon", "hour_sin", "hour_cos", "doy_sin", "doy_cos"]
   use_aux: false
-  # Full feature list = ["cpm25"] + met + emis  →  16 features total
+  # Feature list = ["cpm25"] + met + emis  →  8 features total
 
 time:
   t_in_cpm: 10    # cpm25 history hours available at test time
@@ -27,8 +27,13 @@ time:
 
 data:
   months:      ["APRIL_16", "JULY_16", "OCT_16", "DEC_16"]
-  val_month:   "OCT_16"
+  val_month:   "DEC_16"
   test_samples: 996
+
+preprocessing:
+  cpm25_log1p: true
+  cpm25_grid_zscore: true
+  cpm25_grid_eps: 1.0e-6
 
 # ── Persistence baseline (from EDA) — values in *normalized* [0,1] space ──
 persistence:
@@ -72,8 +77,16 @@ training:
   num_workers:      2
   pin_memory:       true
   seed:             42
+  use_weighted_sampler: true
+  default_sampling_weight: 1.0
+  month_sampling_weights:
+    APRIL_16: 0.5
+    JULY_16: 0.5
+    OCT_16: 1.5
+    DEC_16: 3.0
 
 loss:
+  type: log_rmse
   horizon_weight_min: 0.8
   horizon_weight_max: 1.4
   rmse_weight: 0.8

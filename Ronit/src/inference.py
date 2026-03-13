@@ -14,7 +14,7 @@ import os
 import numpy as np
 import torch
 
-from .data import build_test_input, denormalize
+from .data import build_test_input, denormalize_cpm25
 
 
 def run_inference(cfg, model, bounds: dict) -> np.ndarray:
@@ -35,7 +35,6 @@ def run_inference(cfg, model, bounds: dict) -> np.ndarray:
     output_path = cfg['paths']['output']
 
     # ── Batched inference ──
-    fmin_cpm, fmax_cpm = bounds['cpm25']
     all_preds = []
 
     model.eval()
@@ -48,8 +47,7 @@ def run_inference(cfg, model, bounds: dict) -> np.ndarray:
             batch = torch.from_numpy(x_batch).to(device)
             # batch: (B, C, T, H, W)
             pred_norm = model(batch)          # (B, H, W, T_out) — normalized
-            pred_phys = denormalize(pred_norm.cpu().numpy(), fmin_cpm, fmax_cpm)
-            pred_phys = np.clip(pred_phys, 0.0, None)   # PM2.5 cannot be negative
+            pred_phys = denormalize_cpm25(pred_norm.cpu().numpy(), bounds, cfg)
             all_preds.append(pred_phys)
 
     preds = np.concatenate(all_preds, axis=0).astype(np.float32)

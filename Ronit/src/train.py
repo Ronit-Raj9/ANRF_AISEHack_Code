@@ -51,8 +51,55 @@ def mae_loss(pred: torch.Tensor, target: torch.Tensor, cfg: dict | None = None) 
     return torch.mean(spatial_mae)
 
 
-def objective_loss(pred: torch.Tensor, target: torch.Tensor, cfg: dict) -> torch.Tensor:
-    """Main optimization objective: weighted RMSE + light MAE regularization."""
+def _normalized_to_log1p_domain(x: torch.Tensor, cfg: dict, bounds: dict) -> torch.Tensor:
+    """
+    Convert normalized cpm25 tensors (optionally z-scored) into log1p-physical domain.
+
+    Input shape: (B, H, W, T)
+    Output shape: (B, H, W, T)
+    """
+    y = x
+
+    if bool(cfg.get('preprocessing', {}).get('cpm25_grid_zscore', False)):
+        runtime = cfg.get('_runtime', {})
+        mean = runtime.get('cpm25_grid_mean')
+        std = runtime.get('cpm25_grid_std')
+        if mean is None or std is None:
+            raise RuntimeError(
+                "cpm25 grid z-score enabled but runtime stats are missing in cfg['_runtime']."
+            )
+        mean_t = torch.as_tensor(mean, device=x.device, dtype=x.dtype)[None, :, :, None]
+        std_t = torch.as_tensor(std, device=x.device, dtype=x.dtype)[None, :, :, None]
+        y = y * std_t + mean_t
+
+    fmin, fmax = bounds['cpm25']
+    if bool(cfg.get('preprocessing', {}).get('cpm25_log1p', False)):
+        lo = float(np.log1p(max(fmin, 0.0)))
+        hi = float(np.log1p(max(fmax, 0.0)))
+    else:
+        lo = float(fmin)
+        hi = float(fmax)
+    return y * (hi - lo) + lo
+
+
+def log_rmse_loss(pred: torch.Tensor, target: torch.Tensor, cfg: dict, bounds: dict | None) -> torch.Tensor:
+    """RMSE in log1p-physical domain (after inverse normalization transform)."""
+    if bounds is None or 'cpm25' not in bounds:
+        return rmse_loss(pred, target, cfg)
+    pred_log = _normalized_to_log1p_domain(pred, cfg, bounds)
+    target_log = _normalized_to_log1p_domain(target, cfg, bounds)
+    spatial_mse = torch.mean((pred_log - target_log) ** 2, dim=(1, 2))
+    weights = _horizon_weights(cfg, target)[None]
+    spatial_mse = spatial_mse * weights
+    return torch.mean(torch.sqrt(spatial_mse + 1e-8))
+
+
+def objective_loss(pred: torch.Tensor, target: torch.Tensor, cfg: dict, bounds: dict | None = None) -> torch.Tensor:
+    """Main optimization objective: configurable (log-RMSE or weighted RMSE+MAE)."""
+    loss_type = str(cfg.get('loss', {}).get('type', 'rmse_mae')).lower()
+    if loss_type == 'log_rmse':
+        return log_rmse_loss(pred, target, cfg, bounds)
+
     wrmse = rmse_loss(pred, target, cfg)
     wmae = mae_loss(pred, target, cfg)
     a = cfg.get('loss', {}).get('rmse_weight', 0.8)
@@ -161,7 +208,7 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
         for xb, yb in train_dl:
             xb, yb = xb.to(device), yb.to(device)
             pred   = model(xb)
-            loss   = objective_loss(pred, yb, cfg)
+            loss   = objective_loss(pred, yb, cfg, bounds)
             rmse_metric = rmse_loss(pred, yb, cfg)
 
             optimizer.zero_grad()

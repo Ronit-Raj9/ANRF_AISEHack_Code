@@ -19,7 +19,7 @@ import os
 import gc
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 
 FALLBACK_OFFICIAL_BOUNDS = {
@@ -98,6 +98,73 @@ def normalize(arr: np.ndarray, fmin: float, fmax: float) -> np.ndarray:
 def denormalize(arr: np.ndarray, fmin: float, fmax: float) -> np.ndarray:
     """Inverse of min-max normalization."""
     return arr.astype(np.float32) * (fmax - fmin) + fmin
+
+
+def _use_cpm25_log1p(cfg: dict) -> bool:
+    return bool(cfg.get('preprocessing', {}).get('cpm25_log1p', False))
+
+
+def _use_cpm25_grid_zscore(cfg: dict) -> bool:
+    return bool(cfg.get('preprocessing', {}).get('cpm25_grid_zscore', False))
+
+
+def _cpm25_bounds_for_transform(bounds: dict, cfg: dict) -> tuple[float, float]:
+    fmin, fmax = bounds['cpm25']
+    if _use_cpm25_log1p(cfg):
+        return float(np.log1p(max(fmin, 0.0))), float(np.log1p(max(fmax, 0.0)))
+    return float(fmin), float(fmax)
+
+
+def normalize_feature(arr: np.ndarray, feat: str, bounds: dict, cfg: dict) -> np.ndarray:
+    """Feature-aware normalization with optional cpm25 log1p transform."""
+    if feat == 'cpm25':
+        fmin, fmax = _cpm25_bounds_for_transform(bounds, cfg)
+        x = np.maximum(arr.astype(np.float32), 0.0)
+        if _use_cpm25_log1p(cfg):
+            x = np.log1p(x)
+        return normalize(x, fmin, fmax)
+    return normalize(arr, *bounds[feat])
+
+
+def denormalize_cpm25(arr: np.ndarray, bounds: dict, cfg: dict) -> np.ndarray:
+    """
+    Inverse transform for cpm25 predictions.
+    Supports optional grid z-score (applied over normalized cpm25) and log1p min-max.
+    """
+    x = arr.astype(np.float32)
+
+    runtime = cfg.get('_runtime', {})
+    if _use_cpm25_grid_zscore(cfg):
+        mean = runtime.get('cpm25_grid_mean')
+        std = runtime.get('cpm25_grid_std')
+        if mean is None or std is None:
+            raise RuntimeError(
+                "cpm25 grid z-score enabled but runtime stats are missing. "
+                "Run get_dataloaders(...) before inference in the same session."
+            )
+        x = x * std[None, :, :, None] + mean[None, :, :, None]
+
+    fmin, fmax = _cpm25_bounds_for_transform(bounds, cfg)
+    x = denormalize(x, fmin, fmax)
+
+    if _use_cpm25_log1p(cfg):
+        x = np.expm1(x)
+    return np.clip(x, 0.0, None).astype(np.float32)
+
+
+def _apply_cpm25_grid_zscore(data_list: list, mean: np.ndarray, std: np.ndarray) -> None:
+    """In-place z-score transform for normalized cpm25 maps."""
+    for mdata in data_list:
+        mdata['cpm25'] = ((mdata['cpm25'] - mean[None, :, :]) / std[None, :, :]).astype(np.float32)
+
+
+def _compute_cpm25_grid_stats(train_data: list, eps: float = 1e-6) -> tuple[np.ndarray, np.ndarray]:
+    """Compute per-grid mean/std from train months only over time axis."""
+    concat = np.concatenate([m['cpm25'] for m in train_data], axis=0)  # (T_total, H, W)
+    mean = concat.mean(axis=0).astype(np.float32)
+    std = concat.std(axis=0).astype(np.float32)
+    std = np.maximum(std, eps)
+    return mean, std
 
 
 def _broadcast_scalar_series(values: np.ndarray, H: int, W: int) -> np.ndarray:
@@ -191,7 +258,7 @@ def _load_month(cfg, month: str, bounds: dict) -> dict:
     for feat in features:
         path = os.path.join(data_dir, 'raw', month, f'{feat}.npy')
         arr  = np.load(path)                           # (T, H, W)
-        data[feat] = normalize(arr, *bounds[feat])
+        data[feat] = normalize_feature(arr, feat, bounds, cfg)
 
     T, H, W = data['cpm25'].shape
     time_path = os.path.join(data_dir, 'raw', month, 'time.npy')
@@ -235,13 +302,15 @@ class PM25Dataset(Dataset):
     y : (H=140, W=124, T_out=16)        float32
     """
 
-    def __init__(self, months_data: list, cfg: dict, stride: int):
+    def __init__(self, months_data: list, cfg: dict, stride: int, month_names: list[str] | None = None):
         self.data     = months_data   # list of {feat: (T, H, W) arrays}
         self.feats    = cfg['features']['input']
         self.t_in     = cfg['time']['t_in_met']    # 26
         self.t_cpm    = cfg['time']['t_in_cpm']    # 10
         self.t_out    = cfg['time']['t_out']        # 16
         self.cpm_idx  = 0                           # cpm25 is always index 0
+        self.month_names = month_names or [f'month_{i}' for i in range(len(months_data))]
+        self.sample_months = []
 
         # Build (month_idx, start_t) index
         self.index = []
@@ -250,6 +319,7 @@ class PM25Dataset(Dataset):
             T = mdata[self.feats[0]].shape[0]
             for t in range(0, T - window + 1, stride):
                 self.index.append((m_idx, t))
+                self.sample_months.append(self.month_names[m_idx])
 
     def __len__(self):
         return len(self.index)
@@ -294,15 +364,34 @@ def get_dataloaders(cfg, train_data: list, val_data: list, bounds: dict):
     -------
     train_dl, val_dl, bounds
     """
-    train_ds = PM25Dataset(train_data, cfg, stride=cfg['time']['stride_train'])
-    val_ds   = PM25Dataset(val_data,   cfg, stride=cfg['time']['stride_val'])
+    if _use_cpm25_grid_zscore(cfg):
+        eps = float(cfg.get('preprocessing', {}).get('cpm25_grid_eps', 1e-6))
+        mean, std = _compute_cpm25_grid_stats(train_data, eps=eps)
+        cfg.setdefault('_runtime', {})['cpm25_grid_mean'] = mean
+        cfg['_runtime']['cpm25_grid_std'] = std
+        _apply_cpm25_grid_zscore(train_data, mean, std)
+        _apply_cpm25_grid_zscore(val_data, mean, std)
+
+    train_month_names = cfg['data']['train_months']
+    val_month_names = [cfg['data']['val_month']] * len(val_data)
+    train_ds = PM25Dataset(train_data, cfg, stride=cfg['time']['stride_train'], month_names=train_month_names)
+    val_ds   = PM25Dataset(val_data,   cfg, stride=cfg['time']['stride_val'], month_names=val_month_names)
 
     print(f"  Train samples: {len(train_ds):,}  |  Val samples: {len(val_ds):,}")
+
+    use_sampler = bool(cfg['training'].get('use_weighted_sampler', False))
+    sampler = None
+    if use_sampler:
+        month_w = cfg['training'].get('month_sampling_weights', {})
+        default_w = float(cfg['training'].get('default_sampling_weight', 1.0))
+        weights = [float(month_w.get(month_name, default_w)) for month_name in train_ds.sample_months]
+        sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
 
     train_dl = DataLoader(
         train_ds,
         batch_size  = cfg['training']['batch_size_train'],
-        shuffle     = True,
+        shuffle     = (sampler is None),
+        sampler     = sampler,
         num_workers = cfg['training']['num_workers'],
         pin_memory  = cfg['training'].get('pin_memory', True),
         drop_last   = True,
@@ -350,7 +439,18 @@ def build_test_input(cfg, bounds: dict, start: int = 0, end: int | None = None) 
         if feat == 'cpm25':
             pad = np.zeros((bs, t_in_met - t_in_cpm, 140, 124), dtype=np.float32)
             arr = np.concatenate([arr, pad], axis=1)
-        base[feat] = normalize(arr, *bounds[feat])
+        base[feat] = normalize_feature(arr, feat, bounds, cfg)
+
+    runtime = cfg.get('_runtime', {})
+    if _use_cpm25_grid_zscore(cfg):
+        mean = runtime.get('cpm25_grid_mean')
+        std = runtime.get('cpm25_grid_std')
+        if mean is None or std is None:
+            raise RuntimeError(
+                "cpm25 grid z-score enabled but runtime stats are missing. "
+                "Build dataloaders before calling inference."
+            )
+        base['cpm25'] = ((base['cpm25'] - mean[None, :, :]) / std[None, :, :]).astype(np.float32)
 
     sample_shape = next(iter(base.values())).shape
     N, T, H, W = sample_shape
