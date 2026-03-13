@@ -21,7 +21,7 @@ def _tta_modes(cfg: dict) -> list[str]:
     inf = cfg.get('inference', {})
     if not bool(inf.get('use_tta', False)):
         return ['identity']
-    modes = inf.get('tta_modes', ['identity', 'hflip', 'vflip', 'hvflip'])
+    modes = inf.get('tta_modes', ['identity', 'hflip', 'vflip'])
     valid = {'identity', 'hflip', 'vflip', 'hvflip'}
     modes = [m for m in modes if m in valid]
     return modes or ['identity']
@@ -51,9 +51,15 @@ def _invert_tta_output(y: torch.Tensor, mode: str) -> torch.Tensor:
 def _predict_with_tta(model, batch: torch.Tensor, cfg: dict) -> torch.Tensor:
     modes = _tta_modes(cfg)
     preds = []
+    use_autoregressive = bool(cfg.get('inference', {}).get('use_autoregressive', True))
     for mode in modes:
         x_aug = _apply_tta_input(batch, mode)
-        y_aug = model(x_aug)
+        if use_autoregressive and hasattr(model, 'rollout'):
+            y_aug = model.rollout(x_aug, detach_feedback=False)
+        elif hasattr(model, 'forward_parallel'):
+            y_aug = model.forward_parallel(x_aug)
+        else:
+            y_aug = model(x_aug)
         preds.append(_invert_tta_output(y_aug, mode))
     return torch.stack(preds, dim=0).mean(dim=0)
 
@@ -105,7 +111,7 @@ def run_inference(cfg, model, bounds: dict) -> np.ndarray:
     if state_backup is not None:
         model.load_state_dict(state_backup)
 
-    preds = np.concatenate(all_preds, axis=0).astype(np.float32)
+    preds = np.maximum(np.concatenate(all_preds, axis=0).astype(np.float32), 0.0)
     print(f"Output shape: {preds.shape} | "
           f"range: [{preds.min():.1f}, {preds.max():.1f}] µg/m³")
 

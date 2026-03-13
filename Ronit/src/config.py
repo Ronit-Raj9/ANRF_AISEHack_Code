@@ -51,6 +51,13 @@ def load_config(config_path: str = None) -> dict:
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
+    cfg.setdefault('preprocessing', {})
+    cfg.setdefault('inference', {})
+    cfg.setdefault('training', {})
+    cfg.setdefault('model', {})
+    cfg.setdefault('paths', {})
+    cfg.setdefault('features', {})
+
     # Derived feature lists
     cfg['features']['all'] = ['cpm25'] + cfg['features']['met'] + cfg['features']['emis']
     cfg['features']['base'] = list(cfg['features']['all'])
@@ -59,6 +66,21 @@ def load_config(config_path: str = None) -> dict:
     cfg['features']['input'] = cfg['features']['base'] + cfg['features']['aux']
     cfg['features']['n_features'] = len(cfg['features']['base'])
     cfg['features']['input_channels'] = len(cfg['features']['input'])
+
+    # Modern preprocessing defaults
+    cfg['preprocessing'].setdefault('normalization', 'grid_log_standardize')
+    cfg['preprocessing'].setdefault('use_mmap', True)
+    cfg['preprocessing'].setdefault('grid_chunk_size', 48)
+    cfg['preprocessing'].setdefault('grid_stats_filename', 'grid_log_scaler_2016.npz')
+    cfg['preprocessing'].setdefault('grid_stats_eps', 1.0e-6)
+    cfg['preprocessing'].setdefault('auto_build_grid_stats', True)
+    cfg['preprocessing'].setdefault('signed_log_for_negative', True)
+
+    # Backward-compatible aliases
+    if cfg['preprocessing'].get('cpm25_grid_zscore', False):
+        cfg['preprocessing']['normalization'] = 'grid_log_standardize'
+    if cfg['preprocessing'].get('cpm25_log1p', False):
+        cfg['preprocessing'].setdefault('force_log_targets', True)
 
     # Device
     cfg['device'] = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -78,15 +100,24 @@ def load_config(config_path: str = None) -> dict:
         )
         cfg['paths']['temp']       = _os.path.join(local_out, 'models')
         cfg['paths']['model_save'] = _os.path.join(local_out, 'models', 'best_model.pt')
+        cfg['paths']['checkpoint_dir'] = _os.path.join(local_out, 'models', 'checkpoints')
+        cfg['paths']['checkpoint_last'] = _os.path.join(cfg['paths']['checkpoint_dir'], 'last_checkpoint.pt')
         cfg['paths']['output']     = _os.path.join(local_out, 'submissions', 'preds.npy')
         _os.makedirs(cfg['paths']['temp'], exist_ok=True)
+        _os.makedirs(cfg['paths']['checkpoint_dir'], exist_ok=True)
         _os.makedirs(_os.path.join(local_out, 'submissions'), exist_ok=True)
     else:
         cfg['paths']['data'] = _resolve_kaggle_data_path(cfg)
+        cfg['paths'].setdefault('checkpoint_dir', _os.path.join(cfg['paths']['temp'], 'checkpoints'))
+        cfg['paths'].setdefault('checkpoint_last', _os.path.join(cfg['paths']['checkpoint_dir'], 'last_checkpoint.pt'))
         _os.makedirs(cfg['paths']['temp'], exist_ok=True)
+        _os.makedirs(cfg['paths']['checkpoint_dir'], exist_ok=True)
 
     # Build min_max path from data root
     cfg['paths']['min_max'] = _os.path.join(cfg['paths']['data'], 'stats', 'feat_min_max.mat')
+    cfg['paths']['grid_stats'] = _os.path.join(
+        cfg['paths']['data'], 'stats', cfg['preprocessing']['grid_stats_filename']
+    )
 
     # Model registry settings: allow either top-level model params or nested models.{type}
     model_type = cfg['model'].get('type', 'tfno2d').lower()
@@ -94,10 +125,31 @@ def load_config(config_path: str = None) -> dict:
     for key, value in model_block.items():
         cfg['model'].setdefault(key, value)
 
+    # Training protocol defaults
+    cfg['training'].setdefault('phase1_epochs', 20)
+    cfg['training'].setdefault('phase2_epochs', 20)
+    cfg['training'].setdefault('phase3_epochs', 10)
+    cfg['training'].setdefault(
+        'epochs',
+        cfg['training']['phase1_epochs'] + cfg['training']['phase2_epochs'] + cfg['training']['phase3_epochs'],
+    )
+    cfg['training'].setdefault('checkpoint_metric', 'val_rmse_phys')
+    cfg['training'].setdefault('enable_checkpointing', True)
+    cfg['training'].setdefault('checkpoint_every_epochs', 5)
+    cfg['training'].setdefault('resume_if_available', True)
+    cfg['training'].setdefault('resume_checkpoint_path', '')
+
+    # Inference defaults
+    cfg['inference'].setdefault('use_autoregressive', True)
+    cfg['inference'].setdefault('use_tta', True)
+    cfg['inference'].setdefault('tta_modes', ['identity', 'hflip', 'vflip'])
+    cfg['inference'].setdefault('model_paths', [])
+
     cfg['runtime'] = {
         'on_kaggle': _os.path.exists('/kaggle'),
         'data_exists': _os.path.exists(cfg['paths']['data']),
         'min_max_exists': _os.path.exists(cfg['paths']['min_max']),
+        'grid_stats_exists': _os.path.exists(cfg['paths']['grid_stats']),
     }
 
     if not cfg['runtime']['data_exists']:

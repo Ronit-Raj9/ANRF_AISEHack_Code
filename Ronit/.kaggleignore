@@ -1,0 +1,12 @@
+# Large local artifacts — do NOT upload to Kaggle dataset
+outputs/models/
+outputs/submissions/
+outputs/images/
+src/__pycache__/
+notebooks/.ipynb_checkpoints/
+**/__pycache__/
+**/*.pyc
+*.pt
+*.pth
+*.npy
+*.png

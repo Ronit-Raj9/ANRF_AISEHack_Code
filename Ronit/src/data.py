@@ -1,25 +1,18 @@
 """
-Data loading, normalization, sample construction, and PyTorch Dataset.
+Data loading, grid-wise preprocessing, and memory-mapped sliding-window datasets.
 
-Design notes:
-- Normalization: official min-max from feat_min_max.mat → clip to [0, 1].
-  This ensures train/test consistency and makes the persistence RMSE gate
-  directly interpretable (threshold = 0.0208 in normalized space).
-- Preprocessing: append static geography (`lat`, `lon`) and calendar signals
-    (`hour_sin`, `hour_cos`, `doy_sin`, `doy_cos`) because EDA showed strong
-    spatial stationarity, diurnal solar forcing, and seasonal shift.
-- Lazy Dataset: month arrays are pre-normalized and kept in RAM; windows are
-  sliced on-the-fly in __getitem__.  This avoids building a ~27 GB materialized
-  sample array while still allowing random-access DataLoader batching.
-- Temporal blocking: entire val_month is held out; no window straddles the
-  train/val boundary because they are loaded from separate .npy files.
+Primary mode for the rank-push pipeline:
+- per-feature, per-grid log-standardization over 2016 data
+- sign-preserving log transform for signed variables such as `u10` / `v10`
+- memory-mapped month arrays to stay within Kaggle / local RAM constraints
+- auxiliary diurnal channels (`hour_sin`, `hour_cos`) baked into the dataset
 """
 
-import os
 import gc
+import os
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 
 FALLBACK_OFFICIAL_BOUNDS = {
@@ -41,31 +34,16 @@ FALLBACK_OFFICIAL_BOUNDS = {
     'bio': (0.0, 8.2258e-09),
 }
 
+SIGNED_FEATURES = {'u10', 'v10'}
 
-# ─────────────────────────────────────────────
-# Official Min-Max Normalization Bounds
-# ─────────────────────────────────────────────
 
 def load_minmax_bounds(cfg) -> dict:
-    """
-    Load per-feature normalization bounds from the official feat_min_max.mat.
-
-    Returns
-    -------
-    bounds : dict
-        {feat: (fmin: float, fmax: float)}
-        The mat file stores scalars under keys ``{feat}_min`` / ``{feat}_max``.
-    """
+    """Load official fallback bounds for compatibility and inverse transforms."""
     path = cfg['paths']['min_max']
     features = cfg['features']['all']
-
-    # Local machines can have binary mismatches between NumPy and SciPy.
-    # The official bounds were already verified in EDA, so use the exact
-    # fallback values locally for clean, dependency-light execution.
     if not cfg.get('runtime', {}).get('on_kaggle', False):
         return {feat: FALLBACK_OFFICIAL_BOUNDS[feat] for feat in features}
 
-    sio = None
     if os.path.exists(path):
         try:
             import scipy.io as sio
@@ -87,7 +65,6 @@ def load_minmax_bounds(cfg) -> dict:
 
 
 def normalize(arr: np.ndarray, fmin: float, fmax: float) -> np.ndarray:
-    """Min-max normalize to [0, 1], clip any out-of-range values."""
     rng = fmax - fmin
     if rng == 0:
         return np.zeros_like(arr, dtype=np.float32)
@@ -96,84 +73,196 @@ def normalize(arr: np.ndarray, fmin: float, fmax: float) -> np.ndarray:
 
 
 def denormalize(arr: np.ndarray, fmin: float, fmax: float) -> np.ndarray:
-    """Inverse of min-max normalization."""
     return arr.astype(np.float32) * (fmax - fmin) + fmin
 
 
-def _use_cpm25_log1p(cfg: dict) -> bool:
-    return bool(cfg.get('preprocessing', {}).get('cpm25_log1p', False))
+def _grid_scaler_enabled(cfg: dict) -> bool:
+    return str(cfg.get('preprocessing', {}).get('normalization', 'grid_log_standardize')).lower() == 'grid_log_standardize'
 
 
-def _use_cpm25_grid_zscore(cfg: dict) -> bool:
-    return bool(cfg.get('preprocessing', {}).get('cpm25_grid_zscore', False))
+def _use_mmap(cfg: dict) -> bool:
+    return bool(cfg.get('preprocessing', {}).get('use_mmap', True))
 
 
-def _cpm25_bounds_for_transform(bounds: dict, cfg: dict) -> tuple[float, float]:
-    fmin, fmax = bounds['cpm25']
-    if _use_cpm25_log1p(cfg):
-        return float(np.log1p(max(fmin, 0.0))), float(np.log1p(max(fmax, 0.0)))
-    return float(fmin), float(fmax)
+def _stats_key(feat: str, suffix: str) -> str:
+    return f'{feat}__{suffix}'
 
 
-def normalize_feature(arr: np.ndarray, feat: str, bounds: dict, cfg: dict) -> np.ndarray:
-    """Feature-aware normalization with optional cpm25 log1p transform."""
-    if feat == 'cpm25':
-        fmin, fmax = _cpm25_bounds_for_transform(bounds, cfg)
-        x = np.maximum(arr.astype(np.float32), 0.0)
-        if _use_cpm25_log1p(cfg):
-            x = np.log1p(x)
-        return normalize(x, fmin, fmax)
+def _feature_is_signed(feat: str, bounds: dict | None = None) -> bool:
+    if feat in SIGNED_FEATURES:
+        return True
+    if bounds is not None and feat in bounds:
+        return float(bounds[feat][0]) < 0.0
+    return False
+
+
+def _signed_log1p(x: np.ndarray) -> np.ndarray:
+    x = x.astype(np.float32)
+    return np.sign(x) * np.log1p(np.abs(x))
+
+
+def _inverse_signed_log1p(x: np.ndarray) -> np.ndarray:
+    x = x.astype(np.float32)
+    return np.sign(x) * np.expm1(np.abs(x))
+
+
+def transform_feature(arr: np.ndarray, feat: str, cfg: dict, bounds: dict | None = None) -> np.ndarray:
+    """Apply the research pipeline transform before standardization."""
+    x = arr.astype(np.float32)
+    if _grid_scaler_enabled(cfg):
+        if _feature_is_signed(feat, bounds) and bool(cfg.get('preprocessing', {}).get('signed_log_for_negative', True)):
+            return _signed_log1p(x)
+        return np.log1p(np.maximum(x, 0.0))
+
+    if feat == 'cpm25' and bool(cfg.get('preprocessing', {}).get('cpm25_log1p', False)):
+        return np.log1p(np.maximum(x, 0.0))
+    return x
+
+
+def inverse_transform_feature(arr: np.ndarray, feat: str, cfg: dict, bounds: dict | None = None) -> np.ndarray:
+    """Inverse of `transform_feature` for physical-space metrics/inference."""
+    x = arr.astype(np.float32)
+    if _grid_scaler_enabled(cfg):
+        if _feature_is_signed(feat, bounds) and bool(cfg.get('preprocessing', {}).get('signed_log_for_negative', True)):
+            return _inverse_signed_log1p(x)
+        return np.expm1(x)
+
+    if feat == 'cpm25' and bool(cfg.get('preprocessing', {}).get('cpm25_log1p', False)):
+        return np.expm1(x)
+    return x
+
+
+def build_grid_stats(cfg: dict, bounds: dict, months: list[str] | None = None, force: bool = False) -> dict:
+    """Compute and persist per-feature per-grid mean/std maps over transformed 2016 data."""
+    path = cfg['paths']['grid_stats']
+    if os.path.exists(path) and not force:
+        return load_grid_stats(cfg)
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data_root = cfg['paths']['data']
+    months = list(months or cfg['data']['months'])
+    features = cfg['features']['base']
+    eps = float(cfg.get('preprocessing', {}).get('grid_stats_eps', 1.0e-6))
+    chunk_size = int(cfg.get('preprocessing', {}).get('grid_chunk_size', 48))
+    stats: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    save_dict = {}
+
+    print(f"Building grid scaler → {path}")
+    for feat in features:
+        running_sum = None
+        running_sumsq = None
+        count = 0
+        for month in months:
+            arr_path = os.path.join(data_root, 'raw', month, f'{feat}.npy')
+            arr = np.load(arr_path, mmap_mode='r' if _use_mmap(cfg) else None)
+            t_size = arr.shape[0]
+            for start in range(0, t_size, chunk_size):
+                chunk = np.asarray(arr[start:start + chunk_size], dtype=np.float32)
+                chunk = transform_feature(chunk, feat, cfg, bounds)
+                if running_sum is None:
+                    running_sum = np.zeros(chunk.shape[1:], dtype=np.float64)
+                    running_sumsq = np.zeros(chunk.shape[1:], dtype=np.float64)
+                running_sum += chunk.sum(axis=0, dtype=np.float64)
+                running_sumsq += np.square(chunk, dtype=np.float32).sum(axis=0, dtype=np.float64)
+                count += chunk.shape[0]
+
+        mean = (running_sum / max(count, 1)).astype(np.float32)
+        var = (running_sumsq / max(count, 1)) - np.square(mean, dtype=np.float32)
+        std = np.sqrt(np.maximum(var, eps)).astype(np.float32)
+        stats[feat] = (mean, std)
+        save_dict[_stats_key(feat, 'mean')] = mean
+        save_dict[_stats_key(feat, 'std')] = std
+        print(
+            f"  {feat:8s} mean∈[{mean.min():.3f}, {mean.max():.3f}] "
+            f"std∈[{std.min():.3f}, {std.max():.3f}]"
+        )
+
+    np.savez_compressed(path, **save_dict)
+    return stats
+
+
+def load_grid_stats(cfg: dict) -> dict:
+    """Load per-feature per-grid standardization maps from disk."""
+    path = cfg['paths']['grid_stats']
+    if not os.path.exists(path):
+        if bool(cfg.get('preprocessing', {}).get('auto_build_grid_stats', True)):
+            bounds = load_minmax_bounds(cfg)
+            return build_grid_stats(cfg, bounds=bounds, force=False)
+        raise FileNotFoundError(f"Grid scaler file not found: {path}")
+
+    npz = np.load(path)
+    stats = {}
+    for feat in cfg['features']['base']:
+        stats[feat] = (
+            np.asarray(npz[_stats_key(feat, 'mean')], dtype=np.float32),
+            np.asarray(npz[_stats_key(feat, 'std')], dtype=np.float32),
+        )
+    return stats
+
+
+def describe_grid_stats(grid_stats: dict, features: list[str] | None = None) -> None:
+    """Print a compact scaler summary for notebooks."""
+    features = features or list(grid_stats)
+    print(f"\n{'Feature':10s} {'mean[min,max]':>28s} {'std[min,max]':>28s}")
+    print('─' * 72)
+    for feat in features:
+        mean, std = grid_stats[feat]
+        print(
+            f"{feat:10s} "
+            f"[{mean.min():8.3f}, {mean.max():8.3f}] "
+            f"[{std.min():8.3f}, {std.max():8.3f}]"
+        )
+    print()
+
+
+def normalize_feature(
+    arr: np.ndarray,
+    feat: str,
+    bounds: dict,
+    cfg: dict,
+    grid_stats: dict | None = None,
+) -> np.ndarray:
+    """Feature-aware normalization in either grid-standardized or legacy min-max space."""
+    if _grid_scaler_enabled(cfg):
+        stats = grid_stats or cfg.get('_runtime', {}).get('grid_stats')
+        if stats is None or feat not in stats:
+            raise RuntimeError(f"Grid scaler statistics missing for feature: {feat}")
+        mean, std = stats[feat]
+        x = transform_feature(arr, feat, cfg, bounds)
+        return ((x - mean) / std).astype(np.float32)
+
+    if feat == 'cpm25' and bool(cfg.get('preprocessing', {}).get('cpm25_log1p', False)):
+        fmin, fmax = bounds['cpm25']
+        x = np.log1p(np.maximum(arr.astype(np.float32), 0.0))
+        return normalize(x, np.log1p(max(fmin, 0.0)), np.log1p(max(fmax, 0.0)))
     return normalize(arr, *bounds[feat])
 
 
 def denormalize_cpm25(arr: np.ndarray, bounds: dict, cfg: dict) -> np.ndarray:
-    """
-    Inverse transform for cpm25 predictions.
-    Supports optional grid z-score (applied over normalized cpm25) and log1p min-max.
-    """
+    """Inverse transform for cpm25 predictions into physical µg/m³."""
     x = arr.astype(np.float32)
-
-    runtime = cfg.get('_runtime', {})
-    if _use_cpm25_grid_zscore(cfg):
-        mean = runtime.get('cpm25_grid_mean')
-        std = runtime.get('cpm25_grid_std')
-        if mean is None or std is None:
-            raise RuntimeError(
-                "cpm25 grid z-score enabled but runtime stats are missing. "
-                "Run get_dataloaders(...) before inference in the same session."
-            )
+    if _grid_scaler_enabled(cfg):
+        stats = cfg.get('_runtime', {}).get('grid_stats')
+        if stats is None or 'cpm25' not in stats:
+            raise RuntimeError('Grid scaler statistics for cpm25 are missing in cfg["_runtime"].')
+        mean, std = stats['cpm25']
         x = x * std[None, :, :, None] + mean[None, :, :, None]
+        x = inverse_transform_feature(x, 'cpm25', cfg, bounds)
+        return np.maximum(x, 0.0).astype(np.float32)
 
-    fmin, fmax = _cpm25_bounds_for_transform(bounds, cfg)
-    x = denormalize(x, fmin, fmax)
-
-    if _use_cpm25_log1p(cfg):
+    fmin, fmax = bounds['cpm25']
+    if bool(cfg.get('preprocessing', {}).get('cpm25_log1p', False)):
+        x = denormalize(x, np.log1p(max(fmin, 0.0)), np.log1p(max(fmax, 0.0)))
         x = np.expm1(x)
-    return np.clip(x, 0.0, None).astype(np.float32)
-
-
-def _apply_cpm25_grid_zscore(data_list: list, mean: np.ndarray, std: np.ndarray) -> None:
-    """In-place z-score transform for normalized cpm25 maps."""
-    for mdata in data_list:
-        mdata['cpm25'] = ((mdata['cpm25'] - mean[None, :, :]) / std[None, :, :]).astype(np.float32)
-
-
-def _compute_cpm25_grid_stats(train_data: list, eps: float = 1e-6) -> tuple[np.ndarray, np.ndarray]:
-    """Compute per-grid mean/std from train months only over time axis."""
-    concat = np.concatenate([m['cpm25'] for m in train_data], axis=0)  # (T_total, H, W)
-    mean = concat.mean(axis=0).astype(np.float32)
-    std = concat.std(axis=0).astype(np.float32)
-    std = np.maximum(std, eps)
-    return mean, std
+        return np.maximum(x, 0.0).astype(np.float32)
+    return np.maximum(denormalize(x, fmin, fmax), 0.0).astype(np.float32)
 
 
 def _broadcast_scalar_series(values: np.ndarray, H: int, W: int) -> np.ndarray:
-    """Broadcast a `(T,)` time series to `(T, H, W)` float32 array."""
     return np.broadcast_to(values[:, None, None].astype(np.float32), (len(values), H, W)).copy()
 
 
 def load_static_maps(cfg) -> dict:
-    """Load and normalize static `lat`/`lon` maps to [0, 1]."""
     ll_path = os.path.join(cfg['paths']['data'], 'raw', 'lat_long.npy')
     ll = np.load(ll_path).astype(np.float32)
     lat = ll[:, :, 0]
@@ -184,18 +273,8 @@ def load_static_maps(cfg) -> dict:
 
 
 def _parse_time_strings(time_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Parse hackathon time strings into hour-of-day and day-of-year arrays.
-
-    Returns
-    -------
-    hours : (T,) int32 in [0, 23]
-    doys  : (T,) int32 in [1, 366]
-    """
     ts = np.asarray(time_arr).astype(str)
     hours = np.array([int(t[11:13]) for t in ts], dtype=np.int32)
-
-    # Use numpy datetime for day-of-year to keep leap-year handling correct.
     dt = ts.astype('datetime64[h]')
     year_start = dt.astype('datetime64[Y]')
     doys = (dt.astype('datetime64[D]') - year_start).astype(np.int32) + 1
@@ -203,25 +282,16 @@ def _parse_time_strings(time_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def build_aux_feature_maps(cfg, time_arr: np.ndarray | None, T: int, H: int, W: int) -> dict:
-    """
-    Build auxiliary feature maps used by the research-backed model.
-
-    Features:
-    - `lat`, `lon`: static geography in [0, 1]
-    - `hour_sin`, `hour_cos`: diurnal cycle
-    - `doy_sin`, `doy_cos`: seasonal cycle
-    """
+    """Build static/calendar auxiliary maps requested in config."""
     aux_names = cfg['features'].get('aux', [])
-    static = load_static_maps(cfg)
     aux = {}
+    static = load_static_maps(cfg) if any(a in aux_names for a in ('lat', 'lon')) else {}
 
-    # Static maps
     if 'lat' in aux_names:
         aux['lat'] = np.broadcast_to(static['lat'][None], (T, H, W)).copy()
     if 'lon' in aux_names:
         aux['lon'] = np.broadcast_to(static['lon'][None], (T, H, W)).copy()
 
-    # Calendar maps
     if time_arr is None:
         hours = np.zeros(T, dtype=np.float32)
         doys = np.ones(T, dtype=np.float32)
@@ -236,87 +306,68 @@ def build_aux_feature_maps(cfg, time_arr: np.ndarray | None, T: int, H: int, W: 
         aux['doy_sin'] = _broadcast_scalar_series(np.sin(2 * np.pi * doys / 366.0), H, W)
     if 'doy_cos' in aux_names:
         aux['doy_cos'] = _broadcast_scalar_series(np.cos(2 * np.pi * doys / 366.0), H, W)
-
     return aux
 
 
-# ─────────────────────────────────────────────
-# Month-level Data Loading
-# ─────────────────────────────────────────────
-
 def _load_month(cfg, month: str, bounds: dict) -> dict:
-    """
-    Load and normalize all features for one month.
-
-    Returns
-    -------
-    data : dict  {feat: np.ndarray of shape (T, H, W), dtype float32}
-    """
-    features = cfg['features']['base']
+    """Load one month as memory-mapped raw arrays plus lightweight aux channels."""
     data_dir = cfg['paths']['data']
-    data = {}
-    for feat in features:
-        path = os.path.join(data_dir, 'raw', month, f'{feat}.npy')
-        arr  = np.load(path)                           # (T, H, W)
-        data[feat] = normalize_feature(arr, feat, bounds, cfg)
+    mmap_mode = 'r' if _use_mmap(cfg) else None
+    raw = {}
+    for feat in cfg['features']['base']:
+        raw[feat] = np.load(os.path.join(data_dir, 'raw', month, f'{feat}.npy'), mmap_mode=mmap_mode)
 
-    T, H, W = data['cpm25'].shape
+    T, H, W = raw['cpm25'].shape
     time_path = os.path.join(data_dir, 'raw', month, 'time.npy')
     time_arr = np.load(time_path) if os.path.exists(time_path) else None
-    data.update(build_aux_feature_maps(cfg, time_arr, T, H, W))
-    return data
+    aux = build_aux_feature_maps(cfg, time_arr, T, H, W)
+    return {
+        'raw': raw,
+        'aux': aux,
+        'name': month,
+        'shape': (T, H, W),
+    }
 
 
 def load_all_months(cfg, months: list, bounds: dict) -> list:
-    """
-    Load and normalize multiple months.  Returns a list of dicts (one per month).
-    Memory: ~750 MB per month × 16 features (140×124 grid, float32).
-    """
+    """Load month descriptors without materializing full normalized tensors in RAM."""
     all_data = []
-    for m in months:
-        print(f"  Loading {m} ...", end=" ", flush=True)
-        all_data.append(_load_month(cfg, m, bounds))
-        print("OK")
+    for month in months:
+        print(f"  Loading {month} ...", end=' ', flush=True)
+        all_data.append(_load_month(cfg, month, bounds))
+        print('OK')
         gc.collect()
     return all_data
 
 
-# ─────────────────────────────────────────────
-# PyTorch Dataset — Lazy Sliding Windows
-# ─────────────────────────────────────────────
-
 class PM25Dataset(Dataset):
-    """
-    Lazy sliding-window PM2.5 dataset.
+    """Lazy sliding-window dataset backed by memory-mapped raw arrays."""
 
-    Window logic (per EDA):
-    - Input  : met/emis[t : t+T_IN_MET]  — 26 hrs (10 past + 16 NWP forecast)
-               cpm25  [t : t+T_IN_CPM]   — 10 hrs known; hours 10-25 → 0.0
-    - Target : cpm25  [t+T_IN_CPM :
-                       t+T_IN_CPM+T_OUT]  — next 16 hrs (normalized)
-    Both input and target are in normalized [0, 1] space.
-
-    Output shapes
-    -------------
-    x : (C=input_channels, T_in=26, H=140, W=124)  float32
-    y : (H=140, W=124, T_out=16)        float32
-    """
-
-    def __init__(self, months_data: list, cfg: dict, stride: int, month_names: list[str] | None = None):
-        self.data     = months_data   # list of {feat: (T, H, W) arrays}
-        self.feats    = cfg['features']['input']
-        self.t_in     = cfg['time']['t_in_met']    # 26
-        self.t_cpm    = cfg['time']['t_in_cpm']    # 10
-        self.t_out    = cfg['time']['t_out']        # 16
-        self.cpm_idx  = 0                           # cpm25 is always index 0
+    def __init__(
+        self,
+        months_data: list,
+        cfg: dict,
+        bounds: dict,
+        grid_stats: dict,
+        stride: int,
+        month_names: list[str] | None = None,
+    ):
+        self.data = months_data
+        self.cfg = cfg
+        self.bounds = bounds
+        self.grid_stats = grid_stats
+        self.feats = cfg['features']['input']
+        self.base_feats = set(cfg['features']['base'])
+        self.t_in = cfg['time']['t_in_met']
+        self.t_cpm = cfg['time']['t_in_cpm']
+        self.t_out = cfg['time']['t_out']
         self.month_names = month_names or [f'month_{i}' for i in range(len(months_data))]
         self.sample_months = []
-
-        # Build (month_idx, start_t) index
         self.index = []
-        window = self.t_cpm + self.t_out            # = 26 total consumed
+
+        window = self.t_cpm + self.t_out
         for m_idx, mdata in enumerate(months_data):
-            T = mdata[self.feats[0]].shape[0]
+            T = mdata['shape'][0]
             for t in range(0, T - window + 1, stride):
                 self.index.append((m_idx, t))
                 self.sample_months.append(self.month_names[m_idx])
@@ -324,64 +375,44 @@ class PM25Dataset(Dataset):
     def __len__(self):
         return len(self.index)
 
+    def _slice_feature(self, mdata: dict, feat: str, start: int, stop: int) -> np.ndarray:
+        if feat in self.base_feats:
+            raw = np.asarray(mdata['raw'][feat][start:stop], dtype=np.float32)
+            return normalize_feature(raw, feat, self.bounds, self.cfg, self.grid_stats)
+        return np.asarray(mdata['aux'][feat][start:stop], dtype=np.float32)
+
     def __getitem__(self, idx):
         m_idx, t = self.index[idx]
-        mdata     = self.data[m_idx]
-        t_in      = self.t_in
-        t_cpm     = self.t_cpm
-        t_out     = self.t_out
+        mdata = self.data[m_idx]
 
-        # ── Input tensor (C, T_in, H, W) ──
         channels = []
         for feat in self.feats:
-            chunk = mdata[feat][t : t + t_in].copy()  # (T_in, H, W)
+            chunk = self._slice_feature(mdata, feat, t, t + self.t_in)
             if feat == 'cpm25':
-                chunk[t_cpm:] = 0.0   # mask future cpm25 (not available at test time)
+                chunk[self.t_cpm:] = 0.0
             channels.append(chunk)
-        x = torch.from_numpy(np.stack(channels, axis=0))  # (C, T, H, W)
+        x = torch.from_numpy(np.stack(channels, axis=0).astype(np.float32))
 
-        # ── Target (H, W, T_out) — normalized cpm25 ──
-        y_arr = mdata['cpm25'][t + t_cpm : t + t_cpm + t_out]  # (T_out, H, W)
-        y = torch.from_numpy(y_arr).permute(1, 2, 0)            # (H, W, T_out)
-
+        target_raw = np.asarray(mdata['raw']['cpm25'][t + self.t_cpm:t + self.t_cpm + self.t_out], dtype=np.float32)
+        target = normalize_feature(target_raw, 'cpm25', self.bounds, self.cfg, self.grid_stats)
+        y = torch.from_numpy(target).permute(1, 2, 0)
         return x, y
 
 
-# ─────────────────────────────────────────────
-# DataLoaders
-# ─────────────────────────────────────────────
-
 def get_dataloaders(cfg, train_data: list, val_data: list, bounds: dict):
-    """
-    Build train + validation DataLoaders from pre-loaded month data.
-
-    Parameters
-    ----------
-    train_data, val_data : list of month dicts (from load_all_months)
-    bounds               : normalization bounds dict (for reference / denorm)
-
-    Returns
-    -------
-    train_dl, val_dl, bounds
-    """
-    if _use_cpm25_grid_zscore(cfg):
-        eps = float(cfg.get('preprocessing', {}).get('cpm25_grid_eps', 1e-6))
-        mean, std = _compute_cpm25_grid_stats(train_data, eps=eps)
-        cfg.setdefault('_runtime', {})['cpm25_grid_mean'] = mean
-        cfg['_runtime']['cpm25_grid_std'] = std
-        _apply_cpm25_grid_zscore(train_data, mean, std)
-        _apply_cpm25_grid_zscore(val_data, mean, std)
+    """Build train/validation loaders using the persisted grid scaler."""
+    grid_stats = load_grid_stats(cfg)
+    cfg.setdefault('_runtime', {})['grid_stats'] = grid_stats
 
     train_month_names = cfg['data']['train_months']
     val_month_names = [cfg['data']['val_month']] * len(val_data)
-    train_ds = PM25Dataset(train_data, cfg, stride=cfg['time']['stride_train'], month_names=train_month_names)
-    val_ds   = PM25Dataset(val_data,   cfg, stride=cfg['time']['stride_val'], month_names=val_month_names)
+    train_ds = PM25Dataset(train_data, cfg, bounds, grid_stats, stride=cfg['time']['stride_train'], month_names=train_month_names)
+    val_ds = PM25Dataset(val_data, cfg, bounds, grid_stats, stride=cfg['time']['stride_val'], month_names=val_month_names)
 
     print(f"  Train samples: {len(train_ds):,}  |  Val samples: {len(val_ds):,}")
 
-    use_sampler = bool(cfg['training'].get('use_weighted_sampler', False))
     sampler = None
-    if use_sampler:
+    if bool(cfg['training'].get('use_weighted_sampler', False)):
         month_w = cfg['training'].get('month_sampling_weights', {})
         default_w = float(cfg['training'].get('default_sampling_weight', 1.0))
         weights = [float(month_w.get(month_name, default_w)) for month_name in train_ds.sample_months]
@@ -389,43 +420,34 @@ def get_dataloaders(cfg, train_data: list, val_data: list, bounds: dict):
 
     train_dl = DataLoader(
         train_ds,
-        batch_size  = cfg['training']['batch_size_train'],
-        shuffle     = (sampler is None),
-        sampler     = sampler,
-        num_workers = cfg['training']['num_workers'],
-        pin_memory  = cfg['training'].get('pin_memory', True),
-        drop_last   = True,
+        batch_size=cfg['training']['batch_size_train'],
+        shuffle=(sampler is None),
+        sampler=sampler,
+        num_workers=cfg['training']['num_workers'],
+        pin_memory=cfg['training'].get('pin_memory', True),
+        drop_last=True,
     )
     val_dl = DataLoader(
         val_ds,
-        batch_size  = cfg['training']['batch_size_val'],
-        shuffle     = False,
-        num_workers = cfg['training']['num_workers'],
-        pin_memory  = cfg['training'].get('pin_memory', True),
+        batch_size=cfg['training']['batch_size_val'],
+        shuffle=False,
+        num_workers=cfg['training']['num_workers'],
+        pin_memory=cfg['training'].get('pin_memory', True),
     )
     return train_dl, val_dl
 
 
 def build_test_input(cfg, bounds: dict, start: int = 0, end: int | None = None) -> np.ndarray:
-    """
-    Build normalized test tensor with auxiliary channels.
-
-    Parameters
-    ----------
-    start, end : int
-        Half-open index range [start, end). This enables memory-safe chunked
-        inference. If `end` is None, it defaults to `n_test`.
-
-    Returns
-    -------
-    X_test : (end-start, C=input_channels, T=26, H, W) float32
-    """
-    features  = cfg['features']['base']
+    """Build chunked test tensors in the same transformed space used for training."""
+    features = cfg['features']['base']
     input_feats = cfg['features']['input']
-    data_dir   = cfg['paths']['data']
-    t_in_cpm   = cfg['time']['t_in_cpm']
-    t_in_met   = cfg['time']['t_in_met']
-    n_test     = cfg['data']['test_samples']
+    data_dir = cfg['paths']['data']
+    t_in_cpm = cfg['time']['t_in_cpm']
+    t_in_met = cfg['time']['t_in_met']
+    n_test = cfg['data']['test_samples']
+    grid_stats = cfg.get('_runtime', {}).get('grid_stats') or load_grid_stats(cfg)
+    cfg.setdefault('_runtime', {})['grid_stats'] = grid_stats
+
     if end is None:
         end = n_test
     if not (0 <= start < end <= n_test):
@@ -434,33 +456,28 @@ def build_test_input(cfg, bounds: dict, start: int = 0, end: int | None = None) 
 
     base = {}
     for feat in features:
-        path = os.path.join(data_dir, 'test_in', f'{feat}.npy')
-        arr = np.load(path, mmap_mode='r')[start:end]
+        arr = np.load(os.path.join(data_dir, 'test_in', f'{feat}.npy'), mmap_mode='r')[start:end]
+        arr = np.asarray(arr, dtype=np.float32)
         if feat == 'cpm25':
-            pad = np.zeros((bs, t_in_met - t_in_cpm, 140, 124), dtype=np.float32)
+            pad = np.zeros((bs, t_in_met - t_in_cpm, arr.shape[-2], arr.shape[-1]), dtype=np.float32)
             arr = np.concatenate([arr, pad], axis=1)
-        base[feat] = normalize_feature(arr, feat, bounds, cfg)
+        base[feat] = normalize_feature(arr, feat, bounds, cfg, grid_stats)
 
-    runtime = cfg.get('_runtime', {})
-    if _use_cpm25_grid_zscore(cfg):
-        mean = runtime.get('cpm25_grid_mean')
-        std = runtime.get('cpm25_grid_std')
-        if mean is None or std is None:
-            raise RuntimeError(
-                "cpm25 grid z-score enabled but runtime stats are missing. "
-                "Build dataloaders before calling inference."
-            )
-        base['cpm25'] = ((base['cpm25'] - mean[None, :, :]) / std[None, :, :]).astype(np.float32)
-
-    sample_shape = next(iter(base.values())).shape
-    N, T, H, W = sample_shape
-
+    _, T, H, W = next(iter(base.values())).shape
     time_path = os.path.join(data_dir, 'test_in', 'time.npy')
     time_arr = np.load(time_path) if os.path.exists(time_path) else None
+    if time_arr is not None and len(time_arr) == n_test:
+        time_arr = time_arr[start:end]
     if time_arr is None and cfg['features'].get('aux'):
-        print("Warning: test_in/time.npy not found. Calendar features fall back to neutral defaults at inference.")
-    aux_single = build_aux_feature_maps(cfg, time_arr, T, H, W)
-    aux = {k: np.broadcast_to(v[None], (bs, T, H, W)).copy() for k, v in aux_single.items()}
+        print('Warning: test_in/time.npy not found. Calendar features use neutral defaults.')
+
+    aux_single = build_aux_feature_maps(cfg, None if time_arr is None else time_arr[0], T, H, W)
+    aux = {}
+    for feat, arr in aux_single.items():
+        if arr.shape[0] == T:
+            aux[feat] = np.broadcast_to(arr[None], (bs, T, H, W)).copy()
+        else:
+            aux[feat] = np.broadcast_to(arr, (bs, T, H, W)).copy()
 
     arrays = []
     for feat in input_feats:
@@ -468,16 +485,8 @@ def build_test_input(cfg, bounds: dict, start: int = 0, end: int | None = None) 
     return np.stack(arrays, axis=1).astype(np.float32)
 
 
-# ─────────────────────────────────────────────
-# Legacy helpers (kept for compatibility)
-# ─────────────────────────────────────────────
-
 def compute_stats(cfg, months):
-    """Deprecated: use load_minmax_bounds instead."""
-    raise DeprecationWarning(
-        "compute_stats is removed. Use load_minmax_bounds(cfg) for official "
-        "min-max normalization from feat_min_max.mat."
-    )
+    raise DeprecationWarning('compute_stats is removed. Use build_grid_stats(...) or load_minmax_bounds(cfg).')
 
 
 def save_stats(stats, path):
