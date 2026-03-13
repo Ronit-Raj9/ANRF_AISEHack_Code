@@ -1,0 +1,84 @@
+# ─────────────────────────────────────────────
+# PM2.5 Forecasting — Configuration
+# ─────────────────────────────────────────────
+
+paths:
+  # Kaggle paths (used when /kaggle exists)
+  data:       "/kaggle/input/datasets/khushisingh942004/aisehack"
+  temp:       "/kaggle/temp"
+  model_save: "/kaggle/temp/best_model.pt"
+  output:     "/kaggle/working/preds.npy"
+  # Local paths (auto-applied in config.py when not on Kaggle)
+  data_local: "/home/raj/Documents/CODING/Hackathon/ANRF_AISEHack_Code/aisehack-theme-2"
+
+features:
+  met:  ["u10", "v10", "pblh", "rain", "t2", "q2", "swdown", "psfc"]
+  emis: ["PM25", "SO2", "NOx", "NH3", "NMVOC_e", "NMVOC_finn", "bio"]
+  aux:  ["lat", "lon", "hour_sin", "hour_cos", "doy_sin", "doy_cos"]
+  use_aux: false
+  # Full feature list = ["cpm25"] + met + emis  →  16 features total
+
+time:
+  t_in: 16        # model input window size (fix for PINO)
+  t_in_cpm: 10    # cpm25 history hours available at test time
+  t_in_met: 26    # met/emis input window (10 past + 16 NWP forecast)
+  t_out:    16    # forecast horizon
+  stride_train: 2
+  stride_val:   4
+
+data:
+  months:      ["APRIL_16", "JULY_16", "OCT_16", "DEC_16"]
+  val_month:   "OCT_16"
+  val_split:   0.15
+  test_samples: 996
+
+# ── Persistence baseline (from EDA) — values in *normalized* [0,1] space ──
+persistence:
+  rmse_normalized: 0.0208   # avg RMSE at t+16
+  rmse_physical:   30.83    # µg/m³  (threshold model must beat)
+
+model:
+  type:    "tfno2d"  # baseline first run on Kaggle
+  # U-Net settings
+  base_ch: 64
+  # TFNO2D settings (fallback)
+  width:   32
+  modes:   12
+  depth:   3
+  # Residual spatiotemporal U-Net settings
+  stem_ch: 48
+  dropout: 0.05
+
+models:
+  tfno2d:
+    width: 32
+    modes: 12
+    depth: 3
+  unet:
+    base_ch: 64
+  res_stunet:
+    base_ch: 64
+    stem_ch: 48
+    dropout: 0.05
+
+training:
+  epochs:           60
+  patience:         8          # early-stopping epochs without val improvement
+  batch_size_train: 4
+  batch_size_val:   8
+  batch_size_test:  16
+  lr:               3.0e-4
+  weight_decay:     1.0e-3
+  pct_start:        0.1        # OneCycleLR warmup fraction
+  grad_clip:        1.0
+  num_workers:      2
+  pin_memory:       true
+  seed:             42
+  lambda_d: 1.0
+  lambda_p: 0.03
+
+loss:
+  horizon_weight_min: 0.8
+  horizon_weight_max: 1.4
+  rmse_weight: 0.8
+  mae_weight: 0.2
