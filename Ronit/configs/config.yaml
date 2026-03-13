@@ -111,3 +111,18 @@ inference:
   use_tta: true
   tta_modes: ["identity", "hflip", "vflip", "hvflip"]
   model_paths: []
+
+# ── Weights & Biases ──────────────────────────────────────────────────────────
+wandb:
+  enabled: true
+  entity:  "ronitraj"
+  project: "aisehack"
+  # Leave run_name blank to auto-generate
+  run_name: ""
+  tags:     ["pm25", "spatiotemporal", "aisehack"]
+  # Log the best checkpoint as a W&B artifact
+  log_model: true
+  # How often (epochs) to log per-horizon RMSE heatmap
+  horizon_log_every: 1
+  # Log gradient norms every N batches (0 = off)
+  grad_log_every_batch: 0
