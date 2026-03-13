@@ -4,6 +4,17 @@
 **Dataset URL:** https://www.kaggle.com/datasets/ronitraj1/ronit-pm25-src  
 **Competition:** https://www.kaggle.com/competitions/aisehack-theme-2  
 
+**Current status:** LB ~24 → rank ~38 | First place ~9 | Target: rank 1  
+**Active strategy:** See `outputs/rank1_strategy_report.md`
+
+### Current Live Config (from `configs/config.yaml`)
+- `model.type: tfno2d`
+- `data.val_month: DEC_16`
+- `preprocessing.cpm25_log1p: true`
+- `preprocessing.cpm25_grid_zscore: true`
+- `loss.type: log_rmse`
+- `training.use_weighted_sampler: true`
+
 ---
 
 ## Folder Structure
@@ -22,18 +33,77 @@ Ronit/
 │   ├── __init__.py
 │   ├── config.py              ← Loads config.yaml, resolves paths
 │   ├── data.py                ← Normalization, sample construction, DataLoader
-│   ├── model.py               ← TFNO2D architecture
-│   ├── train.py               ← Training loop, loss, optimizer
-│   ├── inference.py           ← Test inference, saves preds.npy
+│   │                            (log1p, grid z-score, cpm25 masking, weighted sampler)
+│   ├── model.py               ← TFNO2D, UNet, ResidualSTUNet architectures
+│   ├── train.py               ← Training loop, log-RMSE / weighted-RMSE loss, optimizer
+│   ├── inference.py           ← Test inference, denormalize_cpm25, saves preds.npy
 │   └── utils.py               ← Seeding, device info, param count
 │
 ├── notebooks/
 │   ├── eda.ipynb              ← EDA (run locally, CPU only)
+│   ├── eda_online.ipynb       ← Extended EDA with all 33 analysis plots
 │   └── exp_01_baseline.ipynb  ← Kaggle submission notebook
 │
 └── outputs/
+    ├── images/                ← 33 EDA PNG figures
     ├── models/                ← Local model checkpoints (.pt files)
-    └── submissions/           ← Local copies of preds.npy per experiment
+    ├── submissions/           ← Local copies of preds.npy per experiment
+    └── rank1_strategy_report.md  ← Full deep-audit strategy report
+```
+
+---
+
+## Key Design Decisions (Current State)
+
+### CPM25 input masking
+At test time only 10h of cpm25 history is available (hours 11–26 are zeroed in `data.py`).
+Training matches this exactly so there is no train/test mismatch.
+
+### Preprocessing pipeline
+Located in `data.py`, controlled entirely from `config.yaml`:
+```yaml
+preprocessing:
+  cpm25_log1p: true          # log1p(x) before min-max norm → compresses winter tail
+  cpm25_grid_zscore: true    # per-pixel z-score on top of log1p norm
+  cpm25_grid_eps: 1.0e-6     # epsilon to avoid div-by-zero
+```
+Inverse chain at inference: z-score undo → min-max denorm → expm1 (in `denormalize_cpm25`).
+
+### Loss function
+Controlled by `loss.type` in `config.yaml`:
+- `log_rmse` — RMSE in log1p-physical space with per-horizon weighting (current)
+- `weighted_rmse_mae` — weighted blend of RMSE + MAE in normalized space (fallback)
+
+### Weighted sampler
+`training.use_weighted_sampler: true` enables `WeightedRandomSampler`.  
+Weights applied **only to training months** (val month receives no weight and is excluded):
+```yaml
+training:
+  use_weighted_sampler: true
+  month_sampling_weights:
+    APRIL_16: 0.5
+    JULY_16:  0.5
+    OCT_16:   1.5
+    DEC_16:   3.0   # ← only effective when val_month ≠ DEC_16
+```
+> **Known bug:** current `val_month: DEC_16` means DEC is excluded from training, so
+> `DEC_16: 3.0` weight has no effect. Fix: change `val_month: OCT_16` to make DEC part
+> of training and allow oversampling (Protocol P1 in strategy report).
+
+### Available model architectures (`model.type`)
+| Key | Class | Notes |
+|-----|-------|-------|
+| `tfno2d` | `TFNO2D` | Current baseline — fast but limited capacity |
+| `unet` | `UNet` | Classic skip-connection U-Net |
+| `res_stunet` | `ResidualSTUNet` | **Recommended next model** — dual-branch, persistence-residual head |
+
+Switch model by editing one line in `config.yaml`:
+```yaml
+model:
+  type: res_stunet   # switch from tfno2d
+  base_ch: 96        # 64 → 96 for bigger model
+  stem_ch: 64
+  dropout: 0.08
 ```
 
 ---
@@ -43,24 +113,47 @@ Ronit/
 ### `configs/config.yaml` — Your experiment control panel
 This is the **only file that changes between experiments**. Everything else adapts automatically.
 
+> The block below is a **recommended next-run template (Protocol P1)**, not the current live config.
+
 ```yaml
-# Change features to experiment with subsets:
+# ── Features (8 total = cpm25 + 6 met + PM25 emis) ──
 features:
-  met: ["u10", "v10", "pblh", "rain", "t2", "q2"]      # 6 features = faster
-  emis: ["PM25", "SO2", "NOx"]                           # 3 emis = faster
-  # Full 16-feature run: add "swdown","psfc" to met and "NH3","NMVOC_e","NMVOC_finn","bio" to emis
+  met:  ["u10", "v10", "pblh", "rain", "t2", "q2"]
+  emis: ["PM25"]
+  use_aux: false
 
-# Change these for faster first run:
+# ── Preprocessing ──
+preprocessing:
+  cpm25_log1p: true
+  cpm25_grid_zscore: true
+
+# ── Validation / oversampling protocol ──
+data:
+  val_month: "OCT_16"   # P1: use OCT as val → DEC in training → oversampling active
+
 training:
-  epochs: 20          # Start with 20, increase to 30 for final submission
-  stride_train: 3     # Higher = fewer samples = faster epoch (start with 3)
-  stride_val: 6
+  epochs: 60
+  stride_train: 2
+  stride_val: 4
+  use_weighted_sampler: true
+  month_sampling_weights:
+    APRIL_16: 0.5
+    JULY_16:  0.5
+    OCT_16:   1.0      # unused (val month)
+    DEC_16:   3.0      # oversampled in training ✓
 
-# Change these for better model:
+# ── Model ──
 model:
-  width: 64           # Increase to 96/128 for more capacity (uses more memory)
-  modes: 20           # Fourier modes — higher = finer spatial patterns
-  depth: 4            # More blocks = deeper model (slower)
+  type: res_stunet
+  base_ch: 96
+  stem_ch: 64
+  dropout: 0.08
+
+# ── Loss ──
+loss:
+  type: log_rmse
+  horizon_weight_min: 0.8
+  horizon_weight_max: 1.4
 ```
 
 **Rule:** Each experiment = different values here. Never copy-paste into the notebook.
@@ -68,29 +161,23 @@ model:
 ---
 
 ### `src/model.py` — Architecture changes go here
-When adding residuals, changing depth, or trying a new architecture:
-```python
-# In TFNO2D.forward(), change:
-for block in self.blocks:
-    x = block(x)
-# To (adds residual skip connections):
-for block in self.blocks:
-    x = block(x) + x    # ← residual
-```
+Three architectures are defined: `TFNO2D`, `UNet`, `ResidualSTUNet`.
+To add a new feature (e.g. cross-attention bottleneck), add it to `ResidualSTUNet` here.
 
 ---
 
 ### `src/data.py` — Data pipeline changes go here
-- Feature engineering (e.g. wind speed magnitude from u10+v10)
-- Different masking strategies  
-- Augmentations
+- `normalize_feature()` / `denormalize_cpm25()` — feature-aware transform chain
+- `_compute_cpm25_grid_stats()` / `_apply_cpm25_grid_zscore()` — per-pixel z-score
+- `PM25Dataset` — sliding-window samples with cpm25 masking after hour 10
+- Augmentations, feature engineering go here
 
 ---
 
 ### `src/train.py` — Training changes go here
-- Different loss functions
-- Different schedulers
-- Mixed precision training (`torch.cuda.amp`)
+- `log_rmse_loss()` — RMSE in log1p-physical space
+- `objective_loss()` — dispatches to correct loss by `cfg['loss']['type']`
+- AMP (`torch.cuda.amp.autocast` + `GradScaler`) should be added here
 
 ---
 
@@ -209,13 +296,50 @@ conda run -n aisehack kaggle kernels output YOUR_NOTEBOOK_SLUG -p ~/Documents/CO
 
 ---
 
-## Experiment Log (Fill This In)
+## Experiment Log
 
-| # | Date | Config changes | Val RMSE | LB Score | Notes |
-|---|------|---------------|----------|----------|-------|
-| exp_01 | | 10 feat, epoch=20, stride=3 | | | Baseline |
-| exp_02 | | + residual skip | | | |
-| exp_03 | | 16 feat, epoch=30 | | | |
+| # | Date | Model | Key Config Changes | Val RMSE | LB Score | Notes |
+|---|------|-------|-------------------|----------|----------|-------|
+| exp_01 | | tfno2d | 10 feat, epoch=20, stride=3, no log1p | — | ~24 | Baseline run, rank ~38 |
+| exp_A | | tfno2d | Fix val protocol (OCT val), 8 feat, log1p, AMP only | | | Protocol stabilisation |
+| exp_B | | res_stunet | base_ch=96, stem_ch=64, same preprocessing | | | **Primary upgrade** |
+| exp_C | | res_stunet | + intensity-weighted log_rmse | | | Loss emphasis |
+| exp_D | | res_stunet | base_ch=128 if GPU allows | | | Capacity push |
+| exp_E | | tfno2d-XL | width=96, modes=24, depth=6 | | | Diversity model for ensemble |
+| exp_F | | ensemble | Top 2–4 checkpoints + TTA flips | | | **Final submission** |
+
+> **Rule:** Never submit a single-seed single-model after Run B. Always ensemble.
+
+---
+
+## 6-Run Roadmap to Rank 1
+
+### Run A — Stabilisation
+- Fix `val_month: OCT_16` so December oversampling actually activates
+- Keep 8 features + log1p pipeline
+- Add AMP (`autocast` + `GradScaler`) in `src/train.py`
+
+### Run B — Bigger model (biggest expected jump)
+- `model.type: res_stunet`, `base_ch: 96`, `stem_ch: 64`
+- Same preprocessing and loss as Run A
+
+### Run C — Emphasis loss
+- Add intensity-weighted factor to `log_rmse`:
+  `w = 1 + 1.5 * clamp(target_mean / 59, 0, 3)`
+
+### Run D — Max capacity
+- `base_ch: 128` if VRAM allows; else gradient accumulation
+
+### Run E — Diversity model
+- `model.type: tfno2d`, `width: 96`, `modes: 24`, `depth: 6`
+- Train independently for ensemble diversity
+
+### Run F — Submission ensemble
+- Average preds from best Run B/C/D + Run E
+- 4-fold TTA: identity, H-flip, V-flip, both-flip (invert before averaging)
+
+> Optional robust alternative (Protocol P2): keep `val_month: DEC_16`, disable DEC oversampling,
+> and rely on intensity-weighted loss for winter emphasis.
 
 ---
 
@@ -253,12 +377,26 @@ conda run -n aisehack kaggle competitions leaderboard aisehack-theme-2 --show
 ## Submission Checklist
 
 Before every Kaggle run verify:
-- [ ] `config.yaml` has the correct features/epochs/stride
+- [ ] `config.yaml` has the correct `model.type`, `base_ch`, features, epochs, stride
+- [ ] Validation protocol chosen: P1 (`val_month: OCT_16` + DEC oversampling) or P2 (`val_month: DEC_16` + no DEC oversampling)
+- [ ] `preprocessing.cpm25_log1p: true` and `cpm25_grid_zscore: true`
+- [ ] `loss.type: log_rmse`
 - [ ] Dataset version updated on Kaggle (`kaggle datasets version ...`)
 - [ ] Kaggle notebook has latest dataset version (Check for Updates)
 - [ ] Accelerator is set to **GPU P100**
 - [ ] `preds.npy` shape will be `(996, 140, 124, 16)` (guaranteed by `inference.py` assert)
+- [ ] After Run B: **always ensemble** before submitting — no single-model submissions
 - [ ] 3 submissions/day limit — don't waste runs on untested changes
+
+### KPIs to Track Per Run
+After each run, record in the Experiment Log above:
+- Val RMSE overall
+- Val RMSE high-pollution subset (top 20% target means)
+- Per-horizon RMSE at t+1, t+8, t+16
+- LB score
+
+> If a run improves easy subsets but not high-pollution subset, reject it even
+> if average val improves.
 
 ---
 
@@ -266,8 +404,10 @@ Before every Kaggle run verify:
 
 | Action | GPU Hours Used |
 |--------|----------------|
-| Full run, 10 features, 20 epochs | ~4–5h |
-| Full run, 16 features, 30 epochs | ~8–9h |
+| tfno2d, 8 features, 20 epochs | ~4–5h |
+| tfno2d, 8 features, 60 epochs | ~8–9h |
+| res_stunet base_ch=96, 60 epochs | ~9–12h |
+| res_stunet base_ch=128, 60 epochs | ~14–18h |
 | Weekly budget | ~30h |
 
-**Maximum safe runs per week: ~5–6** (with 10 features). Budget carefully.
+**Maximum safe runs per week: ~3–4** (res_stunet) or **~5–6** (tfno2d). Budget carefully.

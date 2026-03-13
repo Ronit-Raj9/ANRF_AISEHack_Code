@@ -17,6 +17,47 @@ import torch
 from .data import build_test_input, denormalize_cpm25
 
 
+def _tta_modes(cfg: dict) -> list[str]:
+    inf = cfg.get('inference', {})
+    if not bool(inf.get('use_tta', False)):
+        return ['identity']
+    modes = inf.get('tta_modes', ['identity', 'hflip', 'vflip', 'hvflip'])
+    valid = {'identity', 'hflip', 'vflip', 'hvflip'}
+    modes = [m for m in modes if m in valid]
+    return modes or ['identity']
+
+
+def _apply_tta_input(x: torch.Tensor, mode: str) -> torch.Tensor:
+    if mode == 'hflip':
+        return x.flip(-1)
+    if mode == 'vflip':
+        return x.flip(-2)
+    if mode == 'hvflip':
+        return x.flip(-2).flip(-1)
+    return x
+
+
+def _invert_tta_output(y: torch.Tensor, mode: str) -> torch.Tensor:
+    # y shape: (B, H, W, T)
+    if mode == 'hflip':
+        return y.flip(2)
+    if mode == 'vflip':
+        return y.flip(1)
+    if mode == 'hvflip':
+        return y.flip(1).flip(2)
+    return y
+
+
+def _predict_with_tta(model, batch: torch.Tensor, cfg: dict) -> torch.Tensor:
+    modes = _tta_modes(cfg)
+    preds = []
+    for mode in modes:
+        x_aug = _apply_tta_input(batch, mode)
+        y_aug = model(x_aug)
+        preds.append(_invert_tta_output(y_aug, mode))
+    return torch.stack(preds, dim=0).mean(dim=0)
+
+
 def run_inference(cfg, model, bounds: dict) -> np.ndarray:
     """
     Load test inputs, run model, denormalize cpm25 predictions, save preds.npy.
@@ -33,6 +74,8 @@ def run_inference(cfg, model, bounds: dict) -> np.ndarray:
     n_test      = cfg['data']['test_samples']
     batch_size  = cfg['training']['batch_size_test']
     output_path = cfg['paths']['output']
+    ckpt_paths = [p for p in cfg.get('inference', {}).get('model_paths', []) if isinstance(p, str) and p]
+    state_backup = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()} if ckpt_paths else None
 
     # ── Batched inference ──
     all_preds = []
@@ -46,9 +89,21 @@ def run_inference(cfg, model, bounds: dict) -> np.ndarray:
                 print(f"Test batch shape: {x_batch.shape} (chunked mode)")
             batch = torch.from_numpy(x_batch).to(device)
             # batch: (B, C, T, H, W)
-            pred_norm = model(batch)          # (B, H, W, T_out) — normalized
+            if ckpt_paths:
+                member_preds = []
+                for ckpt in ckpt_paths:
+                    state = torch.load(ckpt, map_location=device)
+                    model.load_state_dict(state)
+                    member_preds.append(_predict_with_tta(model, batch, cfg))
+                pred_norm = torch.stack(member_preds, dim=0).mean(dim=0)
+            else:
+                pred_norm = _predict_with_tta(model, batch, cfg)
+
             pred_phys = denormalize_cpm25(pred_norm.cpu().numpy(), bounds, cfg)
             all_preds.append(pred_phys)
+
+    if state_backup is not None:
+        model.load_state_dict(state_backup)
 
     preds = np.concatenate(all_preds, axis=0).astype(np.float32)
     print(f"Output shape: {preds.shape} | "

@@ -151,7 +151,14 @@ class UNet(nn.Module):
 class _ResBlock2d(nn.Module):
     """Residual 2D block with GroupNorm and GELU."""
 
-    def __init__(self, in_ch: int, out_ch: int, dropout: float = 0.0):
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        dropout: float = 0.0,
+        use_se: bool = True,
+        drop_path: float = 0.0,
+    ):
         super().__init__()
         g1 = min(8, out_ch)
         while out_ch % g1 != 0 and g1 > 1:
@@ -162,14 +169,49 @@ class _ResBlock2d(nn.Module):
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
         self.norm2 = nn.GroupNorm(g1, out_ch)
         self.drop = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
+        self.se = _SEBlock2d(out_ch) if use_se else nn.Identity()
+        self.drop_path = _StochasticDepth(drop_path)
         self.skip = nn.Conv2d(in_ch, out_ch, 1, bias=False) if in_ch != out_ch else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = self.skip(x)
         x = F.gelu(self.norm1(self.conv1(x)))
         x = self.drop(x)
-        x = self.norm2(self.conv2(x))
+        x = self.se(self.norm2(self.conv2(x)))
+        x = self.drop_path(x)
         return F.gelu(x + residual)
+
+
+class _SEBlock2d(nn.Module):
+    """Squeeze-and-excitation channel attention for robustness on sparse/noisy channels."""
+
+    def __init__(self, channels: int, reduction: int = 8):
+        super().__init__()
+        hidden = max(8, channels // reduction)
+        self.fc1 = nn.Conv2d(channels, hidden, 1)
+        self.fc2 = nn.Conv2d(hidden, channels, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = F.adaptive_avg_pool2d(x, 1)
+        w = F.gelu(self.fc1(w))
+        w = torch.sigmoid(self.fc2(w))
+        return x * w
+
+
+class _StochasticDepth(nn.Module):
+    """Drop-path regularization for residual branches."""
+
+    def __init__(self, p: float = 0.0):
+        super().__init__()
+        self.p = float(p)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (not self.training) or self.p <= 0.0:
+            return x
+        keep = 1.0 - self.p
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        mask = x.new_empty(shape).bernoulli_(keep)
+        return x * mask / keep
 
 
 class _TemporalStem(nn.Module):
@@ -192,23 +234,90 @@ class _TemporalStem(nn.Module):
 
 
 class _ResDown(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, dropout: float = 0.0):
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        dropout: float = 0.0,
+        use_se: bool = True,
+        drop_path: float = 0.0,
+    ):
         super().__init__()
         self.pool = nn.MaxPool2d(2)
-        self.block = _ResBlock2d(in_ch, out_ch, dropout=dropout)
+        self.block = _ResBlock2d(in_ch, out_ch, dropout=dropout, use_se=use_se, drop_path=drop_path)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.block(self.pool(x))
 
 
 class _ResUp(nn.Module):
-    def __init__(self, in_ch: int, skip_ch: int, out_ch: int, dropout: float = 0.0):
+    def __init__(
+        self,
+        in_ch: int,
+        skip_ch: int,
+        out_ch: int,
+        dropout: float = 0.0,
+        use_se: bool = True,
+        drop_path: float = 0.0,
+    ):
         super().__init__()
-        self.block = _ResBlock2d(in_ch + skip_ch, out_ch, dropout=dropout)
+        self.block = _ResBlock2d(in_ch + skip_ch, out_ch, dropout=dropout, use_se=use_se, drop_path=drop_path)
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=False)
         return self.block(torch.cat([x, skip], dim=1))
+
+
+class _CrossFusion2d(nn.Module):
+    """
+    Lightweight cross-fusion between past-state and future-forcing features.
+
+    Uses channel-wise compatibility between projected past/future maps to gate
+    future information before concatenation with persistence input.
+    """
+
+    def __init__(self, ch: int):
+        super().__init__()
+        hidden = max(16, ch // 2)
+        self.q = nn.Conv2d(ch, hidden, 1, bias=False)
+        self.k = nn.Conv2d(ch, hidden, 1, bias=False)
+        self.v = nn.Conv2d(ch, ch, 1, bias=False)
+        self.out = nn.Conv2d(ch * 2 + 1, ch * 2 + 1, 1, bias=False)
+
+    def forward(self, past: torch.Tensor, future: torch.Tensor, last_cpm: torch.Tensor) -> torch.Tensor:
+        q = self.q(past)
+        k = self.k(future)
+        score = torch.sum(q * k, dim=1, keepdim=True) / (q.shape[1] ** 0.5)
+        gate = torch.sigmoid(score)
+        fused_future = self.v(future) * gate
+        x = torch.cat([past, fused_future, last_cpm[:, None]], dim=1)
+        return self.out(x)
+
+
+class _ContextPyramid2d(nn.Module):
+    """Multi-scale bottleneck context using dilated depthwise separable blocks."""
+
+    def __init__(self, channels: int, rates: tuple[int, ...] = (1, 2, 4, 6)):
+        super().__init__()
+        self.branches = nn.ModuleList()
+        for r in rates:
+            self.branches.append(
+                nn.Sequential(
+                    nn.Conv2d(channels, channels, 3, padding=r, dilation=r, groups=channels, bias=False),
+                    nn.Conv2d(channels, channels, 1, bias=False),
+                    nn.GroupNorm(min(8, channels), channels),
+                    nn.GELU(),
+                )
+            )
+        self.mix = nn.Sequential(
+            nn.Conv2d(channels * len(rates), channels, 1, bias=False),
+            nn.GroupNorm(min(8, channels), channels),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feats = [b(x) for b in self.branches]
+        return self.mix(torch.cat(feats, dim=1)) + x
 
 
 class ResidualSTUNet(nn.Module):
@@ -229,6 +338,9 @@ class ResidualSTUNet(nn.Module):
         base_ch: int = 64,
         stem_ch: int = 48,
         dropout: float = 0.05,
+        drop_path: float = 0.03,
+        use_se: bool = True,
+        use_context_pyramid: bool = True,
     ):
         super().__init__()
         self.t_in_cpm = t_in_cpm
@@ -240,22 +352,27 @@ class ResidualSTUNet(nn.Module):
 
         self.past_stem = _TemporalStem(past_in, stem_ch)
         self.future_stem = _TemporalStem(future_in, stem_ch)
-        self.fuse = _ResBlock2d(stem_ch * 2 + 1, base_ch, dropout=dropout)
+        self.cross_fuse = _CrossFusion2d(stem_ch)
+        self.fuse = _ResBlock2d(stem_ch * 2 + 1, base_ch, dropout=dropout, use_se=use_se, drop_path=drop_path * 0.25)
 
-        self.e1 = _ResDown(base_ch, base_ch * 2, dropout=dropout)
-        self.e2 = _ResDown(base_ch * 2, base_ch * 4, dropout=dropout)
-        self.e3 = _ResDown(base_ch * 4, base_ch * 8, dropout=dropout)
-        self.bot = _ResDown(base_ch * 8, base_ch * 16, dropout=dropout)
+        self.e1 = _ResDown(base_ch, base_ch * 2, dropout=dropout, use_se=use_se, drop_path=drop_path * 0.40)
+        self.e2 = _ResDown(base_ch * 2, base_ch * 4, dropout=dropout, use_se=use_se, drop_path=drop_path * 0.60)
+        self.e3 = _ResDown(base_ch * 4, base_ch * 8, dropout=dropout, use_se=use_se, drop_path=drop_path * 0.80)
+        self.bot = _ResDown(base_ch * 8, base_ch * 16, dropout=dropout, use_se=use_se, drop_path=drop_path)
+        self.context = _ContextPyramid2d(base_ch * 16) if use_context_pyramid else nn.Identity()
 
-        self.u3 = _ResUp(base_ch * 16, base_ch * 8, base_ch * 8, dropout=dropout)
-        self.u2 = _ResUp(base_ch * 8, base_ch * 4, base_ch * 4, dropout=dropout)
-        self.u1 = _ResUp(base_ch * 4, base_ch * 2, base_ch * 2, dropout=dropout)
-        self.u0 = _ResUp(base_ch * 2, base_ch, base_ch, dropout=dropout)
+        self.u3 = _ResUp(base_ch * 16, base_ch * 8, base_ch * 8, dropout=dropout, use_se=use_se, drop_path=drop_path * 0.80)
+        self.u2 = _ResUp(base_ch * 8, base_ch * 4, base_ch * 4, dropout=dropout, use_se=use_se, drop_path=drop_path * 0.60)
+        self.u1 = _ResUp(base_ch * 4, base_ch * 2, base_ch * 2, dropout=dropout, use_se=use_se, drop_path=drop_path * 0.40)
+        self.u0 = _ResUp(base_ch * 2, base_ch, base_ch, dropout=dropout, use_se=use_se, drop_path=drop_path * 0.25)
 
-        self.delta_head = nn.Sequential(
-            _ResBlock2d(base_ch, base_ch, dropout=dropout),
-            nn.Conv2d(base_ch, out_steps, 1),
-        )
+        self.delta_trunk = _ResBlock2d(base_ch, base_ch, dropout=dropout, use_se=use_se, drop_path=drop_path * 0.20)
+        self.use_horizon_heads = (out_steps % 4 == 0)
+        if self.use_horizon_heads:
+            chunk = out_steps // 4
+            self.horizon_heads = nn.ModuleList([nn.Conv2d(base_ch, chunk, 1) for _ in range(4)])
+        else:
+            self.horizon_head = nn.Conv2d(base_ch, out_steps, 1)
         self.lead_bias = nn.Parameter(torch.zeros(1, out_steps, 1, 1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -273,18 +390,24 @@ class ResidualSTUNet(nn.Module):
         future_feat = self.future_stem(x_future)
 
         last_cpm = x[:, 0, self.t_in_cpm - 1]
-        z0 = self.fuse(torch.cat([past_feat, future_feat, last_cpm[:, None]], dim=1))
+        z0 = self.fuse(self.cross_fuse(past_feat, future_feat, last_cpm))
         z1 = self.e1(z0)
         z2 = self.e2(z1)
         z3 = self.e3(z2)
         zb = self.bot(z3)
+        zb = self.context(zb)
 
         y3 = self.u3(zb, z3)
         y2 = self.u2(y3, z2)
         y1 = self.u1(y2, z1)
         y0 = self.u0(y1, z0)
 
-        delta = self.delta_head(y0) + self.lead_bias
+        trunk = self.delta_trunk(y0)
+        if self.use_horizon_heads:
+            delta = torch.cat([h(trunk) for h in self.horizon_heads], dim=1)
+        else:
+            delta = self.horizon_head(trunk)
+        delta = delta + self.lead_bias
         persistence = last_cpm[:, None].repeat(1, self.out_steps, 1, 1)
         pred = torch.clamp(persistence + delta, 0.0, 1.0)
         pred = pred[:, :, :H0, :W0]
@@ -426,6 +549,9 @@ def build_model(cfg) -> nn.Module:
             base_ch = cfg['model'].get('base_ch', 64),
             stem_ch = cfg['model'].get('stem_ch', 48),
             dropout = cfg['model'].get('dropout', 0.05),
+            drop_path = cfg['model'].get('drop_path', 0.03),
+            use_se = cfg['model'].get('use_se', True),
+            use_context_pyramid = cfg['model'].get('use_context_pyramid', True),
         )
 
     return model.to(cfg['device'])

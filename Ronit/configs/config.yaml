@@ -27,7 +27,7 @@ time:
 
 data:
   months:      ["APRIL_16", "JULY_16", "OCT_16", "DEC_16"]
-  val_month:   "DEC_16"
+  val_month:   "OCT_16"
   test_samples: 996
 
 preprocessing:
@@ -41,28 +41,34 @@ persistence:
   rmse_physical:   30.83    # µg/m³  (threshold model must beat)
 
 model:
-  type:    "tfno2d"  # baseline first run on Kaggle
+  type:    "res_stunet"  # advanced run primary model
   # U-Net settings
-  base_ch: 64
+  base_ch: 96
   # TFNO2D settings (fallback)
   width:   64
   modes:   20
-  depth:   4
+  depth:   6
   # Residual spatiotemporal U-Net settings
-  stem_ch: 48
-  dropout: 0.05
+  stem_ch: 64
+  dropout: 0.08
+  drop_path: 0.04
+  use_se: true
+  use_context_pyramid: true
 
 models:
   tfno2d:
     width: 64
     modes: 20
-    depth: 4
+    depth: 6
   unet:
     base_ch: 64
   res_stunet:
-    base_ch: 64
-    stem_ch: 48
-    dropout: 0.05
+    base_ch: 96
+    stem_ch: 64
+    dropout: 0.08
+    drop_path: 0.04
+    use_se: true
+    use_context_pyramid: true
 
 training:
   epochs:           60
@@ -77,12 +83,15 @@ training:
   num_workers:      2
   pin_memory:       true
   seed:             42
+  use_amp:          true
   use_weighted_sampler: true
   default_sampling_weight: 1.0
+  checkpoint_metric: mixed
+  checkpoint_mixed_alpha: 0.7
   month_sampling_weights:
     APRIL_16: 0.5
     JULY_16: 0.5
-    OCT_16: 1.5
+    OCT_16: 1.0
     DEC_16: 3.0
 
 loss:
@@ -91,3 +100,14 @@ loss:
   horizon_weight_max: 1.4
   rmse_weight: 0.8
   mae_weight: 0.2
+  intensity_weighted: true
+  intensity_alpha: 1.5
+  intensity_ref: 59.0
+  intensity_cap: 3.0
+  phase_switch_epoch: 20
+  phase2_mode: weighted_mae_phys
+
+inference:
+  use_tta: true
+  tta_modes: ["identity", "hflip", "vflip", "hvflip"]
+  model_paths: []

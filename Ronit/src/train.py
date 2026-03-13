@@ -9,6 +9,7 @@ Training loop with:
 import os
 import numpy as np
 import torch
+from contextlib import nullcontext
 
 # Persistence RMSE baseline in normalized [0,1] cpm25 space (from EDA, t+16 avg)
 PERSISTENCE_RMSE_NORM = 0.0208
@@ -49,6 +50,38 @@ def mae_loss(pred: torch.Tensor, target: torch.Tensor, cfg: dict | None = None) 
         weights = _horizon_weights(cfg, target)[None]
         spatial_mae = spatial_mae * weights
     return torch.mean(spatial_mae)
+
+
+def _normalized_to_physical_domain(x: torch.Tensor, cfg: dict, bounds: dict) -> torch.Tensor:
+    """Convert normalized cpm25 tensor into physical µg/m³ domain."""
+    log_domain = _normalized_to_log1p_domain(x, cfg, bounds)
+    if bool(cfg.get('preprocessing', {}).get('cpm25_log1p', False)):
+        return torch.clamp(torch.expm1(log_domain), min=0.0)
+    return torch.clamp(log_domain, min=0.0)
+
+
+def _intensity_weights(target_phys: torch.Tensor, cfg: dict) -> torch.Tensor:
+    """Per-pixel intensity weights derived from physical target values."""
+    lc = cfg.get('loss', {})
+    alpha = float(lc.get('intensity_alpha', 1.5))
+    ref = float(lc.get('intensity_ref', 59.0))
+    cap = float(lc.get('intensity_cap', 3.0))
+    factor = torch.clamp(target_phys / max(ref, 1e-6), min=0.0, max=cap)
+    return 1.0 + alpha * factor
+
+
+def weighted_mae_phys_loss(pred: torch.Tensor, target: torch.Tensor, cfg: dict, bounds: dict | None) -> torch.Tensor:
+    """Intensity-weighted MAE in physical cpm25 space."""
+    if bounds is None or 'cpm25' not in bounds:
+        return mae_loss(pred, target, cfg)
+    pred_phys = _normalized_to_physical_domain(pred, cfg, bounds)
+    target_phys = _normalized_to_physical_domain(target, cfg, bounds)
+    weights = _intensity_weights(target_phys, cfg)
+    mae = torch.abs(pred_phys - target_phys)
+    weighted = mae * weights
+    spatial = torch.mean(weighted, dim=(1, 2))
+    horizon_w = _horizon_weights(cfg, target)[None]
+    return torch.mean(spatial * horizon_w)
 
 
 def _normalized_to_log1p_domain(x: torch.Tensor, cfg: dict, bounds: dict) -> torch.Tensor:
@@ -94,11 +127,27 @@ def log_rmse_loss(pred: torch.Tensor, target: torch.Tensor, cfg: dict, bounds: d
     return torch.mean(torch.sqrt(spatial_mse + 1e-8))
 
 
-def objective_loss(pred: torch.Tensor, target: torch.Tensor, cfg: dict, bounds: dict | None = None) -> torch.Tensor:
+def objective_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    cfg: dict,
+    bounds: dict | None = None,
+    epoch_idx: int | None = None,
+) -> torch.Tensor:
     """Main optimization objective: configurable (log-RMSE or weighted RMSE+MAE)."""
     loss_type = str(cfg.get('loss', {}).get('type', 'rmse_mae')).lower()
     if loss_type == 'log_rmse':
-        return log_rmse_loss(pred, target, cfg, bounds)
+        base = log_rmse_loss(pred, target, cfg, bounds)
+        if bool(cfg.get('loss', {}).get('intensity_weighted', False)):
+            phase_switch = int(cfg.get('loss', {}).get('phase_switch_epoch', 20))
+            current_epoch = 0 if epoch_idx is None else epoch_idx
+            if current_epoch >= phase_switch:
+                phase2_mode = str(cfg.get('loss', {}).get('phase2_mode', 'weighted_mae_phys')).lower()
+                if phase2_mode == 'weighted_mae_phys':
+                    return weighted_mae_phys_loss(pred, target, cfg, bounds)
+            aux = weighted_mae_phys_loss(pred, target, cfg, bounds)
+            return 0.8 * base + 0.2 * aux
+        return base
 
     wrmse = rmse_loss(pred, target, cfg)
     wmae = mae_loss(pred, target, cfg)
@@ -181,6 +230,7 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
     grad_clip = cfg['training']['grad_clip']
     save_path = cfg['paths']['model_save']
     t_in_cpm  = cfg['time']['t_in_cpm']
+    use_amp   = bool(cfg['training'].get('use_amp', True) and device.type == 'cuda')
 
     # cpm25 range for physical RMSE estimation
     cpm_range = None
@@ -189,10 +239,18 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
         cpm_range  = fmax - fmin   # 1464.25 µg/m³
 
     optimizer, scheduler = get_optimizer(cfg, model, len(train_dl))
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     best_val_loss  = float('inf')
     patience_count = 0
-    history        = {'train_loss': [], 'val_loss': [], 'train_objective': [], 'val_persistence': []}
+    history = {
+        'train_loss': [],
+        'val_loss': [],
+        'train_objective': [],
+        'val_objective': [],
+        'val_persistence': [],
+        'selection_metric': [],
+    }
 
     print(f"\n{'─'*60}")
     print(f"  Persistence gate  (normalized RMSE): {PERSISTENCE_RMSE_NORM:.4f}")
@@ -207,14 +265,19 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
         epoch_rmse = []
         for xb, yb in train_dl:
             xb, yb = xb.to(device), yb.to(device)
-            pred   = model(xb)
-            loss   = objective_loss(pred, yb, cfg, bounds)
-            rmse_metric = rmse_loss(pred, yb, cfg)
+            optimizer.zero_grad(set_to_none=True)
 
-            optimizer.zero_grad()
-            loss.backward()
+            amp_ctx = torch.autocast(device_type='cuda', dtype=torch.float16) if use_amp else nullcontext()
+            with amp_ctx:
+                pred = model(xb)
+                loss = objective_loss(pred, yb, cfg, bounds, epoch_idx=epoch)
+            rmse_metric = rmse_loss(pred.detach(), yb, cfg)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             epoch_losses.append(loss.item())
             epoch_rmse.append(rmse_metric.item())
@@ -222,22 +285,36 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
         # ── Validate ──
         model.eval()
         val_losses = []
+        val_objectives = []
         val_persist = []
         with torch.no_grad():
             for xb, yb in val_dl:
                 xb, yb = xb.to(device), yb.to(device)
                 pred   = model(xb)
                 val_losses.append(rmse_loss(pred, yb, cfg).item())
+                val_objectives.append(objective_loss(pred, yb, cfg, bounds, epoch_idx=epoch).item())
                 val_persist.append(persistence_rmse_from_batch(xb, yb, t_in_cpm).item())
 
         train_objective = float(np.mean(epoch_losses))
         train_loss = float(np.mean(epoch_rmse))
         val_loss   = float(np.mean(val_losses))
+        val_objective = float(np.mean(val_objectives))
         persist_loss = float(np.mean(val_persist))
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
         history['train_objective'].append(train_objective)
+        history['val_objective'].append(val_objective)
         history['val_persistence'].append(persist_loss)
+
+        metric_mode = str(cfg['training'].get('checkpoint_metric', 'val_rmse')).lower()
+        if metric_mode == 'val_objective':
+            selection_metric = val_objective
+        elif metric_mode == 'mixed':
+            alpha = float(cfg['training'].get('checkpoint_mixed_alpha', 0.7))
+            selection_metric = alpha * val_objective + (1.0 - alpha) * val_loss
+        else:
+            selection_metric = val_loss
+        history['selection_metric'].append(selection_metric)
 
         # Physical RMSE estimate
         phys_str = ""
@@ -246,9 +323,9 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
             phys_str  = f"  |  ~{phys_rmse:.1f} µg/m³"
 
         # Checkpoint
-        improved = val_loss < best_val_loss
+        improved = selection_metric < best_val_loss
         if improved:
-            best_val_loss  = val_loss
+            best_val_loss  = selection_metric
             patience_count = 0
             torch.save(model.state_dict(), save_path)
             tag = "  ← saved"
@@ -259,9 +336,11 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
         print(
             f"Epoch {epoch+1:3d}/{epochs} | "
             f"Train: {train_loss:.4f} | "
-            f"Val: {val_loss:.4f}{phys_str} | "
+            f"ValRMSE: {val_loss:.4f}{phys_str} | "
+            f"ValObj: {val_objective:.4f} | "
             f"ValPersist: {persist_loss:.4f} | "
-            f"Best: {best_val_loss:.4f}{tag}"
+            f"Sel: {selection_metric:.4f} | "
+            f"BestSel: {best_val_loss:.4f}{tag}"
         )
 
         # Persistence gate check every 5 epochs
@@ -276,10 +355,13 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
 
     # Final gate check
     print(f"\n{'─'*60}")
-    print(f"Training complete.  Best val RMSE (normalized): {best_val_loss:.4f}")
+    best_idx = int(np.argmin(np.asarray(history['selection_metric'])))
+    best_rmse = history['val_loss'][best_idx]
+    print(f"Training complete. Best checkpoint by selection metric: {best_val_loss:.4f}")
+    print(f"Best val RMSE (normalized): {best_rmse:.4f}")
     if cpm_range is not None:
-        print(f"Best val RMSE (physical estimate): {best_val_loss * cpm_range:.2f} µg/m³")
-    check_persistence_gate(best_val_loss, epoch + 1)
+        print(f"Best val RMSE (physical estimate): {best_rmse * cpm_range:.2f} µg/m³")
+    check_persistence_gate(best_rmse, epoch + 1)
     print(f"{'─'*60}")
 
     return history
