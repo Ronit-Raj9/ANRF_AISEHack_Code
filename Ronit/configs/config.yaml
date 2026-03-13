@@ -50,8 +50,8 @@ model:
   depth:   6
   # Residual spatiotemporal U-Net settings
   stem_ch: 64
-  dropout: 0.08
-  drop_path: 0.04
+  dropout: 0.12
+  drop_path: 0.08
   use_se: true
   use_context_pyramid: true
 
@@ -65,19 +65,19 @@ models:
   res_stunet:
     base_ch: 96
     stem_ch: 64
-    dropout: 0.08
-    drop_path: 0.04
+    dropout: 0.12
+    drop_path: 0.08
     use_se: true
     use_context_pyramid: true
 
 training:
-  epochs:           60
-  patience:         8          # early-stopping epochs without val improvement
+  epochs:           100
+  patience:         15         # early-stopping epochs without val improvement
   batch_size_train: 4
   batch_size_val:   8
   batch_size_test:  16
-  lr:               1.0e-3
-  weight_decay:     1.0e-4
+  lr:               5.0e-4
+  weight_decay:     2.0e-4
   pct_start:        0.1        # OneCycleLR warmup fraction
   grad_clip:        1.0
   num_workers:      2
@@ -92,7 +92,7 @@ training:
     APRIL_16: 0.5
     JULY_16: 0.5
     OCT_16: 1.0
-    DEC_16: 3.0
+    DEC_16: 2.0
 
 loss:
   type: log_rmse
