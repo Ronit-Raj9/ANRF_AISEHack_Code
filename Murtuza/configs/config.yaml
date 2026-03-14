@@ -13,9 +13,10 @@ paths:
 
 features:
   met:  ["u10", "v10", "pblh", "rain", "t2", "q2", "swdown", "psfc"]
-  emis: ["PM25", "SO2", "NOx", "NH3", "NMVOC_e", "NMVOC_finn", "bio"]
+  emis: ["PM25", "NOx", "NH3", "NMVOC_e", "NMVOC_finn"]
   aux:  ["lat", "lon", "hour_sin", "hour_cos", "doy_sin", "doy_cos"]
   use_aux: false
+  add_masks: ["rain_mask"]
   # Full feature list = ["cpm25"] + met + emis  →  16 features total
 
 time:
@@ -31,6 +32,7 @@ data:
   val_month:   "OCT_16"
   val_split:   0.15
   test_samples: 996
+  december_grid_sigma_norm: true
 
 # ── Persistence baseline (from EDA) — values in *normalized* [0,1] space ──
 persistence:

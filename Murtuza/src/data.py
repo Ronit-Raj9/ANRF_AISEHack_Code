@@ -226,9 +226,117 @@ def normalize(arr: np.ndarray, fmin: float, fmax: float) -> np.ndarray:
     return np.clip(normed, 0.0, 1.0)
 
 
-def denormalize(arr: np.ndarray, fmin: float, fmax: float) -> np.ndarray:
-    """Inverse of min-max normalization."""
-    return arr.astype(np.float32) * (fmax - fmin) + fmin
+def denormalize(arr: np.ndarray, fmin: float, fmax: float, feat: str = 'cpm25') -> np.ndarray:
+    """Inverse of preprocessing-aware normalization for a feature (default: cpm25)."""
+    lo_t, hi_t = _transform_bounds(fmin, fmax, feat)
+    x = arr.astype(np.float32) * (hi_t - lo_t) + lo_t
+
+    if feat in MET_LOG1P_FEATURES:
+        return np.expm1(x).astype(np.float32)
+
+    if feat in WIND_SIGNED_LOG1P_FEATURES:
+        return (np.sign(x) * np.expm1(np.abs(x))).astype(np.float32)
+
+    if feat in EMIS_LOG_EPS_FEATURES:
+        return (np.exp(x) - LOG_EPS).astype(np.float32)
+
+    if feat in MASK_ONLY_FEATURES or feat.endswith('_mask'):
+        return (x > 0.5).astype(np.float32)
+
+    return x.astype(np.float32)
+
+
+MET_LOG1P_FEATURES = {'cpm25', 't2', 'pblh', 'q2', 'swdown', 'psfc', 'rain'}
+WIND_SIGNED_LOG1P_FEATURES = {'u10', 'v10'}
+EMIS_LOG_EPS_FEATURES = {'PM25', 'NOx', 'NH3', 'NMVOC_e', 'SO2', 'bio'}
+MASK_ONLY_FEATURES = {'NMVOC_finn'}
+LOG_EPS = np.float32(1e-12)
+DEC_STD_EPS = np.float32(1e-6)
+_DECEMBER_STATS_CACHE: dict[tuple[str, str], tuple[np.ndarray, np.ndarray]] = {}
+
+
+def _transform_feature_values(arr: np.ndarray, feat: str) -> np.ndarray:
+    """Apply feature-specific numeric transforms before normalization."""
+    x = np.asarray(arr, dtype=np.float32)
+
+    if feat in WIND_SIGNED_LOG1P_FEATURES:
+        return np.sign(x) * np.log1p(np.abs(x))
+
+    if feat in MET_LOG1P_FEATURES:
+        return np.log1p(np.clip(x, 0.0, None))
+
+    if feat in EMIS_LOG_EPS_FEATURES:
+        return np.log(np.clip(x, 0.0, None) + LOG_EPS)
+
+    if feat in MASK_ONLY_FEATURES:
+        return (x > 0).astype(np.float32)
+
+    return x
+
+
+def _transform_bounds(fmin: float, fmax: float, feat: str) -> tuple[float, float]:
+    """Transform min-max bounds into the same numeric domain as feature values."""
+    lo = np.float32(fmin)
+    hi = np.float32(fmax)
+
+    if feat in WIND_SIGNED_LOG1P_FEATURES:
+        lo_t = np.sign(lo) * np.log1p(np.abs(lo))
+        hi_t = np.sign(hi) * np.log1p(np.abs(hi))
+    elif feat in MET_LOG1P_FEATURES:
+        lo_t = np.log1p(np.clip(lo, 0.0, None))
+        hi_t = np.log1p(np.clip(hi, 0.0, None))
+    elif feat in EMIS_LOG_EPS_FEATURES:
+        lo_t = np.log(np.clip(lo, 0.0, None) + LOG_EPS)
+        hi_t = np.log(np.clip(hi, 0.0, None) + LOG_EPS)
+    elif feat in MASK_ONLY_FEATURES or feat.endswith('_mask'):
+        return 0.0, 1.0
+    else:
+        lo_t, hi_t = lo, hi
+
+    return float(min(lo_t, hi_t)), float(max(lo_t, hi_t))
+
+
+def preprocess_feature(arr: np.ndarray, feat: str, bounds: dict, month: str | None = None) -> np.ndarray:
+    """
+    Feature-specific preprocessing + normalization.
+
+    - Meteo/cpm25 scalar fields: log1p domain (or signed-log1p for winds)
+    - Emissions: log(x+1e-12) in float32-safe range
+    - NMVOC_finn: binary mask only
+    - PBLH: season-aware scaling via month-local min-max after transform
+    """
+    x = _transform_feature_values(arr, feat)
+
+    if feat == 'pblh' and month is not None:
+        lo = float(np.nanmin(x))
+        hi = float(np.nanmax(x))
+        if np.isclose(hi - lo, 0.0):
+            return np.zeros_like(x, dtype=np.float32)
+        return np.clip((x - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+
+    fmin, fmax = _transform_bounds(*bounds[feat], feat)
+    return normalize(x, fmin, fmax)
+
+
+def _get_december_grid_stats(cfg: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Return (mu, sigma) over time for DEC_16 cpm25 in log1p domain, cached per data root."""
+    data_dir = cfg['paths']['data']
+    dec_month = cfg.get('data', {}).get('december_month', 'DEC_16')
+    cache_key = (data_dir, dec_month)
+    if cache_key in _DECEMBER_STATS_CACHE:
+        return _DECEMBER_STATS_CACHE[cache_key]
+
+    dec_path = os.path.join(data_dir, 'raw', dec_month, 'cpm25.npy')
+    if not os.path.exists(dec_path):
+        raise FileNotFoundError(f"December cpm25 file not found for grid-wise sigma stats: {dec_path}")
+
+    dec_raw = np.load(dec_path).astype(np.float32)  # (T,H,W)
+    dec_log = _transform_feature_values(dec_raw, 'cpm25')
+    mu = np.mean(dec_log, axis=0).astype(np.float32)
+    sigma = np.std(dec_log, axis=0).astype(np.float32)
+    sigma = np.maximum(sigma, DEC_STD_EPS)
+    _DECEMBER_STATS_CACHE[cache_key] = (mu, sigma)
+    return mu, sigma
 
 
 def _broadcast_scalar_series(values: np.ndarray, H: int, W: int) -> np.ndarray:
@@ -318,8 +426,20 @@ def _load_month(cfg, month: str, bounds: dict) -> dict:
     """
     features = cfg['features']['base']
     data_dir = cfg['paths']['data']
-    data = {}
+    data = {'__month__': month}
+    raw_cache = {}
     for feat in features:
+        if feat == 'rain_mask':
+            if 'rain' not in raw_cache:
+                rain_path = os.path.join(data_dir, 'raw', month, 'rain.npy')
+                print(f"Trying to load: {rain_path}")
+                if not os.path.exists(rain_path):
+                    print(f"File missing: {rain_path}")
+                    raise FileNotFoundError(f"Missing file: {rain_path}")
+                raw_cache['rain'] = np.load(rain_path)
+            data[feat] = (raw_cache['rain'] > 0).astype(np.float32)
+            continue
+
         path = os.path.join(data_dir, 'raw', month, f'{feat}.npy')
         print(f"Trying to load: {path}")
         if not os.path.exists(path):
@@ -330,7 +450,21 @@ def _load_month(cfg, month: str, bounds: dict) -> dict:
         except Exception as e:
             print(f"Failed to load {path}: {e}")
             raise
-        data[feat] = normalize(arr, *bounds[feat])
+        raw_cache[feat] = arr
+        data[feat] = preprocess_feature(arr, feat, bounds, month=month)
+        if feat == 'cpm25':
+            data['__cpm25_log1p__'] = _transform_feature_values(arr, 'cpm25').astype(np.float32)
+
+    if month.upper().startswith('DEC') and cfg.get('data', {}).get('december_grid_sigma_norm', True):
+        mu, sigma = _get_december_grid_stats(cfg)
+        data['__dec_mu__'] = mu
+        data['__dec_sigma__'] = sigma
+
+    for emis_feat in ('PM25', 'NOx', 'NH3', 'NMVOC_e'):
+        if emis_feat in data:
+            std = float(np.std(data[emis_feat]))
+            if std <= 0.0:
+                raise RuntimeError(f"Emission feature {emis_feat} collapsed to zero variance after preprocessing.")
 
     if 'cpm25' not in data:
         print(f"cpm25 missing in month {month}, skipping.")
@@ -409,6 +543,7 @@ class PM25Dataset(Dataset):
         self.t_cpm    = cfg['time']['t_in_cpm']    # 10
         self.t_out    = cfg['time']['t_out']        # 16
         self.cpm_idx  = 0                           # cpm25 is always index 0
+        self.december_sigma_norm = bool(cfg.get('data', {}).get('december_grid_sigma_norm', True))
 
         # Build (month_idx, start_t) index
         self.index = []
@@ -433,6 +568,13 @@ class PM25Dataset(Dataset):
         for feat in self.feats:
             chunk = mdata[feat][t : t + t_in].copy()  # (T_in, H, W)
             if feat == 'cpm25':
+                month_name = str(mdata.get('__month__', '')).upper()
+                if self.december_sigma_norm and month_name.startswith('DEC') and '__cpm25_log1p__' in mdata:
+                    mu = mdata.get('__dec_mu__', None)
+                    sigma = mdata.get('__dec_sigma__', None)
+                    if mu is not None and sigma is not None:
+                        cpm_log_chunk = mdata['__cpm25_log1p__'][t : t + t_in].copy()
+                        chunk = ((cpm_log_chunk - mu[None, :, :]) / sigma[None, :, :]).astype(np.float32)
                 chunk[t_cpm:] = 0.0   # mask future cpm25 (not available at test time)
             channels.append(chunk)
         x = torch.from_numpy(np.stack(channels, axis=0))  # (C, T, H, W)
@@ -511,13 +653,28 @@ def build_test_input(cfg, bounds: dict, start: int = 0, end: int | None = None) 
     bs = end - start
 
     base = {}
+    dec_mu = dec_sigma = None
+    if cfg.get('data', {}).get('december_grid_sigma_norm', True):
+        dec_mu, dec_sigma = _get_december_grid_stats(cfg)
+
     for feat in features:
+        if feat == 'rain_mask':
+            rain_path = os.path.join(data_dir, 'test_in', 'rain.npy')
+            rain_arr = np.load(rain_path, mmap_mode='r')[start:end]
+            base[feat] = (rain_arr > 0).astype(np.float32)
+            continue
+
         path = os.path.join(data_dir, 'test_in', f'{feat}.npy')
         arr = np.load(path, mmap_mode='r')[start:end]
         if feat == 'cpm25':
+            cpm_proc = preprocess_feature(arr, feat, bounds, month=None)
+            if dec_mu is not None and dec_sigma is not None:
+                cpm_log = _transform_feature_values(arr, 'cpm25')
+                cpm_proc = ((cpm_log - dec_mu[None, :, :]) / dec_sigma[None, :, :]).astype(np.float32)
             pad = np.zeros((bs, t_in_met - t_in_cpm, 140, 124), dtype=np.float32)
-            arr = np.concatenate([arr, pad], axis=1)
-        base[feat] = normalize(arr, *bounds[feat])
+            base[feat] = np.concatenate([cpm_proc, pad], axis=1)
+            continue
+        base[feat] = preprocess_feature(arr, feat, bounds, month=None)
 
     sample_shape = next(iter(base.values())).shape
     N, T, H, W = sample_shape

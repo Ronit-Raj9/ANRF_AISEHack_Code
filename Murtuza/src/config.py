@@ -53,7 +53,8 @@ def load_config(config_path: str = None) -> dict:
 
     # Derived feature lists
     cfg['features']['all'] = ['cpm25'] + cfg['features']['met'] + cfg['features']['emis']
-    cfg['features']['base'] = list(cfg['features']['all'])
+    extra_masks = list(cfg['features'].get('add_masks', []))
+    cfg['features']['base'] = list(cfg['features']['all']) + extra_masks
     use_aux = bool(cfg['features'].get('use_aux', False))
     cfg['features']['aux'] = list(cfg['features'].get('aux', [])) if use_aux else []
     cfg['features']['input'] = cfg['features']['base'] + cfg['features']['aux']
