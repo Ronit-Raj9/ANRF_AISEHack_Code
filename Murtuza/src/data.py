@@ -3,12 +3,15 @@ from torch.utils.data import Dataset, DataLoader, TensorDataset, random_split
 
 # Sliding window dataset for time series
 class SlidingWindowTensorDataset(Dataset):
-    def __init__(self, tensor, window_size, t_out, target_channel=0):
+    def __init__(self, tensor, window_size, t_out, target_channel=0, t_in_cpm=None):
         # tensor: (N, C, T, H, W)
+        # t_in_cpm: if set, future cpm25 (channel target_channel, steps t_in_cpm:) are
+        #           zeroed out to match the test-time masking condition.
         self.tensor = tensor
         self.window_size = window_size
         self.t_out = t_out
         self.target_channel = target_channel
+        self.t_in_cpm = t_in_cpm  # None means no masking (backward compat)
         self.N, self.C, self.T, self.H, self.W = tensor.shape
         self.num_windows = self.T - window_size - t_out + 1
         if self.num_windows <= 0:
@@ -29,6 +32,10 @@ class SlidingWindowTensorDataset(Dataset):
         y_end = y_start + self.t_out
         yb = self.tensor[n, self.target_channel, y_start:y_end, :, :]  # (T_out, H, W)
         xb = torch.tensor(xb, dtype=torch.float32)
+        # Mask future cpm25 (hours t_in_cpm onwards) so training matches test-time
+        # conditions: at test time only t_in_cpm observed hours are available.
+        if self.t_in_cpm is not None and self.t_in_cpm < self.window_size:
+            xb[self.target_channel, self.t_in_cpm:] = 0.0
         yb = torch.tensor(yb, dtype=torch.float32).permute(1, 2, 0)  # (H, W, T_out)
         return xb, yb
 
@@ -58,11 +65,35 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, TensorDataset
 
-def add_physical_features(tensor, features_dict=None, lat_long_path='lat_long.npy', cfg=None):
+# ── Month name → integer (1-12) helper for month encoding ──────────────────
+_MONTH_NAME_TO_NUM = {
+    'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'APRIL': 4,
+    'MAY': 5, 'JUN': 6, 'JUNE': 6, 'JUL': 7, 'JULY': 7,
+    'AUG': 8, 'SEP': 9, 'SEPT': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12,
+}
+
+def _month_num_from_name(name: str) -> int:
+    """Parse month number (1-12) from strings like 'APRIL_16', 'DEC_16', etc."""
+    upper = name.upper()
+    for key, val in _MONTH_NAME_TO_NUM.items():
+        if upper.startswith(key):
+            return val
+    return 1  # fallback
+
+
+def add_physical_features(tensor, features_dict=None, lat_long_path='lat_long.npy', cfg=None, months=None):
     """
         Add engineered physics channels for PINO in a memory-efficient way:
       wind_speed, wind_dir, RH, hour_sin, hour_cos, month_sin, month_cos,
             hotspot_clim, lag_1, lag_3, lag_6
+
+    Parameters
+    ----------
+    months : list of str, optional
+        Month name strings (e.g. ['APRIL_16', 'JULY_16', ...]) of length N.
+        When provided, month_sin/cos are computed from the actual calendar month
+        for each month in the batch, fixing the constant-placeholder bug.
+        When None, falls back to the legacy constant placeholder.
 
     Memory strategy: pre-allocate a single float32 output array and fill each
     engineered channel one at a time (rather than materialising a large stack).
@@ -117,12 +148,24 @@ def add_physical_features(tensor, features_dict=None, lat_long_path='lat_long.np
     for vals in [
         np.sin(np.float32(2 * np.pi) * hour / np.float32(24)),
         np.cos(np.float32(2 * np.pi) * hour / np.float32(24)),
-        np.full(T, np.sin(np.float32(2 * np.pi / 12)), dtype=np.float32),  # placeholder month
-        np.full(T, np.cos(np.float32(2 * np.pi / 12)), dtype=np.float32),
     ]:
-        # Assign (T,) → (N, T, H, W) via numpy broadcasting during assignment
         out[:, ch] = vals.reshape(1, T, 1, 1)
         ch += 1
+
+    # ── Month encoding — per-month if months list provided, else constant ────
+    # The constant placeholder (sin(2π/12)) was the same scalar for every month
+    # in the batch, making the channels completely uninformative.  With the
+    # months list we compute the correct calendar-month encoding per sample.
+    if months is not None and len(months) == N:
+        for n_idx in range(N):
+            m_num = np.float32(_month_num_from_name(months[n_idx]))
+            out[n_idx, ch]     = np.sin(np.float32(2 * np.pi) * m_num / np.float32(12))
+            out[n_idx, ch + 1] = np.cos(np.float32(2 * np.pi) * m_num / np.float32(12))
+    else:
+        # Legacy fallback: constant placeholder (backward compatibility)
+        out[:, ch]     = np.sin(np.float32(2 * np.pi / 12))
+        out[:, ch + 1] = np.cos(np.float32(2 * np.pi / 12))
+    ch += 2
     del hour
     gc.collect()
 
@@ -140,11 +183,15 @@ def add_physical_features(tensor, features_dict=None, lat_long_path='lat_long.np
     gc.collect()
 
     # ── PM2.5 lags ───────────────────────────────────────────────────────────
+    # np.roll wraps the boundary: lag_6[t=0..5] would incorrectly contain the
+    # last frames of the same month.  Zero-pad the boundary instead.
     cpm25 = tensor[:, features_dict['cpm25'], :, :, :].copy()
-    out[:, ch] = np.roll(cpm25, 1, axis=1);  ch += 1   # axis=1 is T in (N,T,H,W)
-    out[:, ch] = np.roll(cpm25, 3, axis=1);  ch += 1
-    out[:, ch] = np.roll(cpm25, 6, axis=1);  ch += 1
-    del cpm25
+    for lag_steps in (1, 3, 6):
+        lagged = np.roll(cpm25, lag_steps, axis=1)
+        lagged[:, :lag_steps, :, :] = 0.0  # clear wrapped-around values
+        out[:, ch] = lagged
+        ch += 1
+    del cpm25, lagged
     gc.collect()
 
     assert ch == C + N_ENG, f"Channel count mismatch: expected {C + N_ENG}, got {ch}"
@@ -363,12 +410,10 @@ def preprocess_feature(arr: np.ndarray, feat: str, bounds: dict, month: str | No
     """
     x = _transform_feature_values(arr, feat)
 
-    if feat == 'pblh' and month is not None:
-        lo = float(np.nanmin(x))
-        hi = float(np.nanmax(x))
-        if np.isclose(hi - lo, 0.0):
-            return np.zeros_like(x, dtype=np.float32)
-        return np.clip((x - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+    # NOTE: PBLH previously used per-month local min-max when month was given,
+    # but global bounds at test time (month=None).  This created a train/test
+    # distribution mismatch — PBLH summer peaks could clip completely differently.
+    # Fix: always use the global official bounds from feat_min_max.mat.
 
     fmin, fmax = _transform_bounds(*bounds[feat], feat)
     return normalize(x, fmin, fmax)
@@ -559,9 +604,14 @@ def make_dataloaders(cfg, tensor, bounds):
     # Build windows from the full tensor first, then split window indices.
     # This uses all available months/data instead of dropping entire months
     # based on a month-level split.
-    full_ds = SlidingWindowTensorDataset(tensor, window_size, t_out=t_out, target_channel=0)
+    # t_in_cpm: masks future cpm25 hours (t_in_cpm:window_size) to zeros so
+    # training matches test-time conditions (only 10 observed hours available).
+    t_in_cpm = cfg['time'].get('t_in_cpm', 10)
+    full_ds = SlidingWindowTensorDataset(
+        tensor, window_size, t_out=t_out, target_channel=0, t_in_cpm=t_in_cpm
+    )
     n_total = len(full_ds)
-    n_val = max(1, int(n_total * val_split))
+    n_val   = max(1, int(n_total * val_split))
     n_train = n_total - n_val
     if n_train <= 0:
         raise ValueError(f"Invalid val_split={val_split}; not enough windows for training.")
@@ -727,13 +777,13 @@ def build_test_input(cfg, bounds: dict, start: int = 0, end: int | None = None) 
         if feat == 'cpm25':
             # Standard min-max log1p normalization — matches SlidingWindowTensorDataset
             cpm_proc = preprocess_feature(arr, feat, bounds, month=None)
-            # Fill unknown future cpm25 hours with persistence (repeat last known frame).
-            # Training saw actual future cpm25 values; persistence is the closest
-            # in-distribution approximation at test time.
-            n_fill = t_in_met - t_in_cpm  # = 16
-            last_known = cpm_proc[:, -1:, :, :]  # (bs, 1, H, W)
-            fill = np.repeat(last_known, n_fill, axis=1)  # (bs, 16, H, W)
-            base[feat] = np.concatenate([cpm_proc, fill], axis=1)  # (bs, 26, H, W)
+            # Fill unknown future cpm25 hours (t_in_cpm:) with ZEROS.
+            # SlidingWindowTensorDataset now zeros out these hours during training
+            # (xb[cpm_channel, t_in_cpm:] = 0.0), so inference must match.
+            # Using persistence previously created a train/test distribution mismatch.
+            n_fill   = t_in_met - t_in_cpm  # = 16
+            zeros    = np.zeros((bs, n_fill, *cpm_proc.shape[2:]), dtype=np.float32)
+            base[feat] = np.concatenate([cpm_proc, zeros], axis=1)  # (bs, 26, H, W)
             continue
         base[feat] = preprocess_feature(arr, feat, bounds, month=None)
 

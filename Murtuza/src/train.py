@@ -147,7 +147,9 @@ def compute_physics_loss(pred, xb, yb, cfg):
     grad_h = torch.gradient(pred, dim=1)[0]
     grad_w = torch.gradient(pred, dim=2)[0]
 
-    feature_names = cfg.get('features', {}).get('all', [])
+    # 'features.all' does not exist in config — use 'features.base' which is the
+    # actual list of base feature names used at training time.
+    feature_names = cfg.get('features', {}).get('base', [])
 
     def _feat_idx(name: str):
         if name in feature_names:

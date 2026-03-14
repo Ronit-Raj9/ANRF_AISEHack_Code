@@ -364,6 +364,8 @@ class TFNO2D(nn.Module):
         for block in self.blocks:
             x = block(x)
         x = self.proj(x)                  # (B, T_out, H, W)
+        x = torch.clamp(x, 0.0, 1.0)      # keep preds in normalized [0,1] — prevents negative
+                                           # PM2.5 predictions wasting gradient budget
         return x.permute(0, 2, 3, 1)      # (B, H, W, T_out)
 
 
