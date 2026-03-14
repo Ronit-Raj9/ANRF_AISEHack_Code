@@ -66,7 +66,7 @@ models:
     dropout: 0.1
 
 training:
-  epochs:           80
+  epochs:           20
   patience:         20         # larger model needs longer runway
   batch_size_train: 2
   batch_size_val:   4
