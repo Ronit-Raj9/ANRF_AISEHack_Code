@@ -1,0 +1,1141 @@
+import torch
+from torch.utils.data import Dataset, DataLoader, TensorDataset, Subset
+
+# Sliding window dataset for time series
+class SlidingWindowTensorDataset(Dataset):
+    def __init__(self, tensor, window_size, t_out, target_channel=0, t_in_cpm=None):
+        # tensor: (N, C, T, H, W)
+        # t_in_cpm: if set, future cpm25 (channel target_channel, steps t_in_cpm:) are
+        #           zeroed out to match the test-time masking condition.
+        self.tensor = tensor
+        self.window_size = window_size
+        self.t_out = t_out
+        self.target_channel = target_channel
+        self.t_in_cpm = t_in_cpm  # None means no masking (backward compat)
+        self.N, self.C, self.T, self.H, self.W = tensor.shape
+        self.num_windows = self.T - window_size - t_out + 1
+        if self.num_windows <= 0:
+            raise ValueError(
+                f"Not enough time steps for sliding windows: T={self.T}, "
+                f"t_in={window_size}, t_out={t_out}."
+            )
+        self.total = self.N * self.num_windows
+
+    def __len__(self):
+        return self.total
+
+    def __getitem__(self, idx):
+        n = idx // self.num_windows
+        w = idx % self.num_windows
+        xb = self.tensor[n, :, w:w+self.window_size, :, :]  # (C, window_size, H, W)
+        y_start = w + self.window_size
+        y_end = y_start + self.t_out
+        yb = self.tensor[n, self.target_channel, y_start:y_end, :, :]  # (T_out, H, W)
+        xb = torch.tensor(xb, dtype=torch.float32)
+        # Mask future cpm25 (hours t_in_cpm onwards) so training matches test-time
+        # conditions: at test time only t_in_cpm observed hours are available.
+        if self.t_in_cpm is not None and self.t_in_cpm < self.window_size:
+            xb[self.target_channel, self.t_in_cpm:] = 0.0
+        yb = torch.tensor(yb, dtype=torch.float32).permute(1, 2, 0)  # (H, W, T_out)
+        return xb, yb
+
+"""
+Data loading, normalization, sample construction, and PyTorch Dataset.
+ 
+Design notes:
+- Normalization: official min-max from feat_min_max.mat → clip to [0, 1].
+    This ensures train/test consistency and makes the persistence RMSE gate
+    directly interpretable (threshold = 0.0208 in normalized space).
+- Preprocessing: append static geography (`lat`, `lon`) and calendar signals
+        (`hour_sin`, `hour_cos`, `doy_sin`, `doy_cos`) because EDA showed strong
+        spatial stationarity, diurnal solar forcing, and seasonal shift.
+- Lazy Dataset: month arrays are pre-normalized and kept in RAM; windows are
+    sliced on-the-fly in __getitem__.  This avoids building a ~27 GB materialized
+    sample array while still allowing random-access DataLoader batching.
+- Temporal blocking: entire val_month is held out; no window straddles the
+    train/val boundary because they are loaded from separate .npy files.
+
+import torch
+from torch.utils.data import TensorDataset, DataLoader
+"""
+
+import os
+import gc
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader, TensorDataset
+
+# ── Month name → integer (1-12) helper for month encoding ──────────────────
+_MONTH_NAME_TO_NUM = {
+    'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'APRIL': 4,
+    'MAY': 5, 'JUN': 6, 'JUNE': 6, 'JUL': 7, 'JULY': 7,
+    'AUG': 8, 'SEP': 9, 'SEPT': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12,
+}
+
+def _month_num_from_name(name: str) -> int:
+    """Parse month number (1-12) from strings like 'APRIL_16', 'DEC_16', etc."""
+    upper = name.upper()
+    for key, val in _MONTH_NAME_TO_NUM.items():
+        if upper.startswith(key):
+            return val
+    return 1  # fallback
+
+
+def add_physical_features(tensor, features_dict=None, lat_long_path='lat_long.npy', cfg=None, months=None):
+    """
+        Add engineered physics channels for PINO in a memory-efficient way:
+      wind_speed, wind_dir, RH, hour_sin, hour_cos, month_sin, month_cos,
+            hotspot_clim, lag_1, lag_3, lag_6
+
+    Parameters
+    ----------
+    months : list of str, optional
+        Month name strings (e.g. ['APRIL_16', 'JULY_16', ...]) of length N.
+        When provided, month_sin/cos are computed from the actual calendar month
+        for each month in the batch, fixing the constant-placeholder bug.
+        When None, falls back to the legacy constant placeholder.
+
+    Memory strategy: pre-allocate a single float32 output array and fill each
+    engineered channel one at a time (rather than materialising a large stack).
+    This cuts peak RAM from ~3x tensor size down to ~1.75x tensor size.
+    """
+    import numpy as np
+    import gc
+
+    # ── Normalise dtype to float32 immediately ───────────────────────────────
+    tensor = np.asarray(tensor, dtype=np.float32)
+    N, C, T, H, W = tensor.shape
+    N_ENG = 11
+
+    # Pre-allocate output: (N, C+N_ENG, T, H, W) float32
+    out = np.empty((N, C + N_ENG, T, H, W), dtype=np.float32)
+    out[:, :C] = tensor          # copy base channels (no extra alloc beyond out)
+    ch = C                       # next free channel index
+
+    # ── Wind speed ──────────────────────────────────────────────────────────
+    u10 = tensor[:, features_dict['u10'], :, :, :]   # (N,T,H,W) view, float32
+    v10 = tensor[:, features_dict['v10'], :, :, :]
+    out[:, ch] = np.sqrt(u10 ** 2 + v10 ** 2)
+    ch += 1
+
+    # ── Wind direction ───────────────────────────────────────────────────────
+    out[:, ch] = np.arctan2(v10, u10)
+    ch += 1
+    del u10, v10
+    gc.collect()
+
+    # ── Relative humidity ────────────────────────────────────────────────────
+    t2 = tensor[:, features_dict['t2'], :, :, :].copy().astype(np.float32)
+    q2 = tensor[:, features_dict['q2'], :, :, :].copy().astype(np.float32)
+    denom_safe = np.where(np.abs(t2 - 29.65) < 1e-3,
+                          np.sign(t2 - 29.65 + np.float32(1e-3)) * np.float32(1e-3),
+                          t2 - np.float32(29.65)).astype(np.float32)
+    exponent = np.clip(
+        np.float32(17.67) * (t2 - np.float32(273.15)) / denom_safe,
+        np.float32(-87.0),
+        np.float32(87.0),
+    )
+    with np.errstate(over='ignore', invalid='ignore'):
+        rh = q2 / (np.float32(0.622) + np.float32(0.378) * q2 + np.float32(1e-8)) * np.exp(exponent)
+    np.nan_to_num(rh, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    out[:, ch] = np.clip(rh, np.float32(0.0), np.float32(1.5))
+    ch += 1
+    del t2, q2, denom_safe, exponent, rh
+    gc.collect()
+
+    # ── Temporal cycles (float32, broadcast-on-assign, no materialisation) ──
+    hour = (np.arange(T, dtype=np.float32) % 24)
+    for vals in [
+        np.sin(np.float32(2 * np.pi) * hour / np.float32(24)),
+        np.cos(np.float32(2 * np.pi) * hour / np.float32(24)),
+    ]:
+        out[:, ch] = vals.reshape(1, T, 1, 1)
+        ch += 1
+
+    # ── Month encoding — per-month if months list provided, else constant ────
+    # The constant placeholder (sin(2π/12)) was the same scalar for every month
+    # in the batch, making the channels completely uninformative.  With the
+    # months list we compute the correct calendar-month encoding per sample.
+    if months is not None and len(months) == N:
+        for n_idx in range(N):
+            m_num = np.float32(_month_num_from_name(months[n_idx]))
+            out[n_idx, ch]     = np.sin(np.float32(2 * np.pi) * m_num / np.float32(12))
+            out[n_idx, ch + 1] = np.cos(np.float32(2 * np.pi) * m_num / np.float32(12))
+    else:
+        # Legacy fallback: constant placeholder (backward compatibility)
+        out[:, ch]     = np.sin(np.float32(2 * np.pi / 12))
+        out[:, ch + 1] = np.cos(np.float32(2 * np.pi / 12))
+    ch += 2
+    del hour
+    gc.collect()
+
+    # ── Static hotspot climatology prior ────────────────────────────────────
+    if cfg is not None and cfg.get('data', {}).get('use_hotspot_climatology_channel', True):
+        prior_map, _ = get_hotspot_maps(cfg)
+    else:
+        # fallback: derive prior from already-loaded cpm25 channel
+        cpm = tensor[:, features_dict['cpm25'], :, :, :]
+        prior_map = np.log1p(np.clip(np.mean(cpm, axis=(0, 1)), 0.0, None)).astype(np.float32)
+        prior_map = (prior_map - prior_map.mean()) / (prior_map.std() + np.float32(1e-6))
+    out[:, ch] = prior_map.reshape(1, 1, H, W)
+    ch += 1
+    del prior_map
+    gc.collect()
+
+    # ── PM2.5 lags ───────────────────────────────────────────────────────────
+    # np.roll wraps the boundary: lag_6[t=0..5] would incorrectly contain the
+    # last frames of the same month.  Zero-pad the boundary instead.
+    cpm25 = tensor[:, features_dict['cpm25'], :, :, :].copy()
+    for lag_steps in (1, 3, 6):
+        lagged = np.roll(cpm25, lag_steps, axis=1)
+        lagged[:, :lag_steps, :, :] = 0.0  # clear wrapped-around values
+        out[:, ch] = lagged
+        ch += 1
+    del cpm25, lagged
+    gc.collect()
+
+    assert ch == C + N_ENG, f"Channel count mismatch: expected {C + N_ENG}, got {ch}"
+
+    # ── NaN/Inf guard (in-place, no extra copy) ──────────────────────────────
+    n_bad = int(np.sum(~np.isfinite(out)))
+    if n_bad > 0:
+        import warnings
+        warnings.warn(f"add_physical_features: replacing {n_bad} NaN/Inf values with 0")
+        np.nan_to_num(out, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return out
+
+FALLBACK_OFFICIAL_BOUNDS = {
+    'cpm25': (0.9940, 1465.25),
+    'u10': (-26.829, 29.026),
+    'v10': (-29.216, 31.930),
+    'pblh': (52.115, 6271.4),
+    'rain': (0.0, 96.627),
+    't2': (223.53, 324.77),
+    'q2': (0.0, 0.045855),
+    'swdown': (0.0, 1320.3),
+    'psfc': (47353.0, 102290.0),
+    'PM25': (0.0, 1.4269e-07),
+    'SO2': (0.0, 5.4354e-08),
+    'NOx': (0.0, 7.9771e-08),
+    'NH3': (0.0, 2.0868e-08),
+    'NMVOC_e': (0.0, 1.0691e-08),
+    'NMVOC_finn': (0.0, 7.0491e-06),
+    'bio': (0.0, 8.2258e-09),
+}
+
+
+# ─────────────────────────────────────────────
+# Official Min-Max Normalization Bounds
+# ─────────────────────────────────────────────
+
+def load_minmax_bounds(cfg) -> dict:
+    """
+    Load per-feature normalization bounds from the official feat_min_max.mat.
+
+    Returns
+    -------
+    bounds : dict
+        {feat: (fmin: float, fmax: float)}
+        The mat file stores scalars under keys ``{feat}_min`` / ``{feat}_max``.
+    """
+    path = cfg['paths']['min_max']
+    features = cfg['features']['all']
+
+    # Local machines can have binary mismatches between NumPy and SciPy.
+    # The official bounds were already verified in EDA, so use the exact
+    # fallback values locally for clean, dependency-light execution.
+    if not cfg.get('runtime', {}).get('on_kaggle', False):
+        return {feat: FALLBACK_OFFICIAL_BOUNDS[feat] for feat in features}
+
+    sio = None
+    if os.path.exists(path):
+        try:
+            import scipy.io as sio
+            mat = sio.loadmat(path)
+            return {
+                feat: (
+                    float(mat[f'{feat}_min'].squeeze()),
+                    float(mat[f'{feat}_max'].squeeze()),
+                )
+                for feat in features
+            }
+        except Exception as exc:
+            print(f"Warning: failed to read feat_min_max.mat via scipy ({exc}). Using fallback bounds.")
+
+    missing = [feat for feat in features if feat not in FALLBACK_OFFICIAL_BOUNDS]
+    if missing:
+        raise KeyError(f"Missing fallback bounds for features: {missing}")
+    return {feat: FALLBACK_OFFICIAL_BOUNDS[feat] for feat in features}
+
+
+                                                                                                                                                                                                                                                                                                                 
+def normalize(arr: np.ndarray, fmin: float, fmax: float) -> np.ndarray:
+    """Min-max normalize to [0, 1], clip any out-of-range values."""
+    rng = fmax - fmin
+    if rng == 0:
+        return np.zeros_like(arr, dtype=np.float32)
+    normed = (arr.astype(np.float32) - fmin) / rng
+    return np.clip(normed, 0.0, 1.0)
+
+
+def denormalize(arr: np.ndarray, fmin: float, fmax: float, feat: str = 'cpm25') -> np.ndarray:
+    """Inverse of preprocessing-aware normalization for a feature (default: cpm25)."""
+    lo_t, hi_t = _transform_bounds(fmin, fmax, feat)
+    x = arr.astype(np.float32) * (hi_t - lo_t) + lo_t
+
+    if feat in MET_LOG1P_FEATURES:
+        return np.expm1(x).astype(np.float32)
+
+    if feat in WIND_SIGNED_LOG1P_FEATURES:
+        return (np.sign(x) * np.expm1(np.abs(x))).astype(np.float32)
+
+    if feat in EMIS_LOG_EPS_FEATURES:
+        return (np.exp(x) - LOG_EPS).astype(np.float32)
+
+    if feat in MASK_ONLY_FEATURES or feat.endswith('_mask'):
+        return (x > 0.5).astype(np.float32)
+
+    return x.astype(np.float32)
+
+
+MET_LOG1P_FEATURES = {'cpm25', 't2', 'pblh', 'q2', 'swdown', 'psfc', 'rain'}
+WIND_SIGNED_LOG1P_FEATURES = {'u10', 'v10'}
+EMIS_LOG_EPS_FEATURES = {'PM25', 'NOx', 'NH3', 'NMVOC_e', 'SO2', 'bio'}
+MASK_ONLY_FEATURES = {'NMVOC_finn'}
+LOG_EPS = np.float32(1e-12)
+DEC_STD_EPS = np.float32(1e-6)
+_DECEMBER_STATS_CACHE: dict[tuple[str, str], tuple[np.ndarray, np.ndarray]] = {}
+_HOTSPOT_MAP_CACHE: dict[tuple[str, tuple[str, ...], int], tuple[np.ndarray, np.ndarray]] = {}
+
+
+def get_hotspot_maps(cfg: dict) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build hotspot climatology prior and spatial loss-weight map from raw cpm25.
+
+    Returns
+    -------
+    prior_z : (H, W) float32
+        log1p(climatology) standardized to zero mean / unit std.
+    weights : (H, W) float32
+        log1p(climatology) normalized so global mean weight = 1.0.
+    """
+    data_dir = cfg['paths']['data']
+    months = tuple(cfg.get('data', {}).get('train_months', cfg['data']['months']))
+    t_in_cpm = int(cfg.get('time', {}).get('t_in_cpm', 10))
+    cache_key = (data_dir, months, t_in_cpm)
+    if cache_key in _HOTSPOT_MAP_CACHE:
+        return _HOTSPOT_MAP_CACHE[cache_key]
+
+    sum_map = None
+    count = 0
+    for month in months:
+        cpm_path = os.path.join(data_dir, 'raw', month, 'cpm25.npy')
+        if not os.path.exists(cpm_path):
+            raise FileNotFoundError(f"Missing cpm25 file for hotspot climatology: {cpm_path}")
+        arr = np.load(cpm_path).astype(np.float32)  # (T,H,W)
+        if arr.ndim != 3:
+            raise ValueError(f"Unexpected cpm25 shape in {cpm_path}: {arr.shape}")
+        month_sum = np.sum(arr, axis=0)
+        if sum_map is None:
+            sum_map = month_sum
+        else:
+            sum_map += month_sum
+        count += arr.shape[0]
+
+    if sum_map is None or count <= 0:
+        raise RuntimeError("Failed to build hotspot climatology map (empty training cpm25).")
+
+    clim_raw = (sum_map / np.float32(count)).astype(np.float32)
+    clim_log = np.log1p(np.clip(clim_raw, 0.0, None)).astype(np.float32)
+
+    prior_mean = float(np.mean(clim_log))
+    prior_std = float(np.std(clim_log))
+    prior_z = ((clim_log - np.float32(prior_mean)) / np.float32(prior_std + 1e-6)).astype(np.float32)
+
+    weights = (clim_log / np.float32(np.mean(clim_log) + 1e-6)).astype(np.float32)
+    _HOTSPOT_MAP_CACHE[cache_key] = (prior_z, weights)
+    return prior_z, weights
+
+
+def _transform_feature_values(arr: np.ndarray, feat: str) -> np.ndarray:
+    """Apply feature-specific numeric transforms before normalization."""
+    x = np.asarray(arr, dtype=np.float32)
+
+    if feat in WIND_SIGNED_LOG1P_FEATURES:
+        return np.sign(x) * np.log1p(np.abs(x))
+
+    if feat in MET_LOG1P_FEATURES:
+        return np.log1p(np.clip(x, 0.0, None))
+
+    if feat in EMIS_LOG_EPS_FEATURES:
+        return np.log(np.clip(x, 0.0, None) + LOG_EPS)
+
+    if feat in MASK_ONLY_FEATURES:
+        return (x > 0).astype(np.float32)
+
+    return x
+
+
+def _transform_bounds(fmin: float, fmax: float, feat: str) -> tuple[float, float]:
+    """Transform min-max bounds into the same numeric domain as feature values."""
+    lo = np.float32(fmin)
+    hi = np.float32(fmax)
+
+    if feat in WIND_SIGNED_LOG1P_FEATURES:
+        lo_t = np.sign(lo) * np.log1p(np.abs(lo))
+        hi_t = np.sign(hi) * np.log1p(np.abs(hi))
+    elif feat in MET_LOG1P_FEATURES:
+        lo_t = np.log1p(np.clip(lo, 0.0, None))
+        hi_t = np.log1p(np.clip(hi, 0.0, None))
+    elif feat in EMIS_LOG_EPS_FEATURES:
+        lo_t = np.log(np.clip(lo, 0.0, None) + LOG_EPS)
+        hi_t = np.log(np.clip(hi, 0.0, None) + LOG_EPS)
+    elif feat in MASK_ONLY_FEATURES or feat.endswith('_mask'):
+        return 0.0, 1.0
+    else:
+        lo_t, hi_t = lo, hi
+
+    return float(min(lo_t, hi_t)), float(max(lo_t, hi_t))
+
+
+def preprocess_feature(arr: np.ndarray, feat: str, bounds: dict, month: str | None = None) -> np.ndarray:
+    """
+    Feature-specific preprocessing + normalization.
+
+    - Meteo/cpm25 scalar fields: log1p domain (or signed-log1p for winds)
+    - Emissions: log(x+1e-12) in float32-safe range
+    - NMVOC_finn: binary mask only
+    - PBLH: season-aware scaling via month-local min-max after transform
+    """
+    x = _transform_feature_values(arr, feat)
+
+    # NOTE: PBLH previously used per-month local min-max when month was given,
+    # but global bounds at test time (month=None).  This created a train/test
+    # distribution mismatch — PBLH summer peaks could clip completely differently.
+    # Fix: always use the global official bounds from feat_min_max.mat.
+
+    fmin, fmax = _transform_bounds(*bounds[feat], feat)
+    return normalize(x, fmin, fmax)
+
+
+def _get_december_grid_stats(cfg: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Return (mu, sigma) over time for DEC_16 cpm25 in log1p domain, cached per data root."""
+    data_dir = cfg['paths']['data']
+    dec_month = cfg.get('data', {}).get('december_month', 'DEC_16')
+    cache_key = (data_dir, dec_month)
+    if cache_key in _DECEMBER_STATS_CACHE:
+        return _DECEMBER_STATS_CACHE[cache_key]
+
+    dec_path = os.path.join(data_dir, 'raw', dec_month, 'cpm25.npy')
+    if not os.path.exists(dec_path):
+        raise FileNotFoundError(f"December cpm25 file not found for grid-wise sigma stats: {dec_path}")
+
+    dec_raw = np.load(dec_path).astype(np.float32)  # (T,H,W)
+    dec_log = _transform_feature_values(dec_raw, 'cpm25')
+    mu = np.mean(dec_log, axis=0).astype(np.float32)
+    sigma = np.std(dec_log, axis=0).astype(np.float32)
+    sigma = np.maximum(sigma, DEC_STD_EPS)
+    _DECEMBER_STATS_CACHE[cache_key] = (mu, sigma)
+    return mu, sigma
+
+
+def _broadcast_scalar_series(values: np.ndarray, H: int, W: int) -> np.ndarray:
+    """Broadcast a `(T,)` time series to `(T, H, W)` float32 array."""
+    return np.broadcast_to(values[:, None, None].astype(np.float32), (len(values), H, W)).copy()
+
+
+def load_static_maps(cfg) -> dict:
+    """Load and normalize static `lat`/`lon` maps to [0, 1]."""
+    ll_path = os.path.join(cfg['paths']['data'], 'raw', 'lat_long.npy')
+    ll = np.load(ll_path).astype(np.float32)
+    lat = ll[:, :, 0]
+    lon = ll[:, :, 1]
+    lat = (lat - lat.min()) / (lat.max() - lat.min() + 1e-8)
+    lon = (lon - lon.min()) / (lon.max() - lon.min() + 1e-8)
+    return {'lat': lat.astype(np.float32), 'lon': lon.astype(np.float32)}
+
+
+def _parse_time_strings(time_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Parse hackathon time strings into hour-of-day and day-of-year arrays.
+
+    Returns
+    -------
+    hours : (T,) int32 in [0, 23]
+    doys  : (T,) int32 in [1, 366]
+    """
+    ts = np.asarray(time_arr).astype(str)
+    hours = np.array([int(t[11:13]) for t in ts], dtype=np.int32)
+
+    # Use numpy datetime for day-of-year to keep leap-year handling correct.
+    dt = ts.astype('datetime64[h]')
+    year_start = dt.astype('datetime64[Y]')
+    doys = (dt.astype('datetime64[D]') - year_start).astype(np.int32) + 1
+    return hours, doys
+
+
+def build_aux_feature_maps(cfg, time_arr: np.ndarray | None, T: int, H: int, W: int) -> dict:
+    """
+    Build auxiliary feature maps used by the research-backed model.
+
+    Features:
+    - `lat`, `lon`: static geography in [0, 1]
+    - `hour_sin`, `hour_cos`: diurnal cycle
+    - `doy_sin`, `doy_cos`: seasonal cycle
+    """
+    aux_names = cfg['features'].get('aux', [])
+    static = load_static_maps(cfg)
+    aux = {}
+
+    # Static maps
+    if 'lat' in aux_names:
+        aux['lat'] = np.broadcast_to(static['lat'][None], (T, H, W)).copy()
+    if 'lon' in aux_names:
+        aux['lon'] = np.broadcast_to(static['lon'][None], (T, H, W)).copy()
+
+    # Calendar maps
+    if time_arr is None:
+        hours = np.zeros(T, dtype=np.float32)
+        doys = np.ones(T, dtype=np.float32)
+    else:
+        hours, doys = _parse_time_strings(time_arr)
+
+    if 'hour_sin' in aux_names:
+        aux['hour_sin'] = _broadcast_scalar_series(np.sin(2 * np.pi * hours / 24.0), H, W)
+    if 'hour_cos' in aux_names:
+        aux['hour_cos'] = _broadcast_scalar_series(np.cos(2 * np.pi * hours / 24.0), H, W)
+    if 'doy_sin' in aux_names:
+        aux['doy_sin'] = _broadcast_scalar_series(np.sin(2 * np.pi * doys / 366.0), H, W)
+    if 'doy_cos' in aux_names:
+        aux['doy_cos'] = _broadcast_scalar_series(np.cos(2 * np.pi * doys / 366.0), H, W)
+
+    return aux
+
+
+# ─────────────────────────────────────────────
+# Month-level Data Loading
+# ─────────────────────────────────────────────
+
+def _load_month(cfg, month: str, bounds: dict) -> dict:
+    """
+    Load and normalize all features for one month.
+
+    Returns
+    -------
+    data : dict  {feat: np.ndarray of shape (T, H, W), dtype float32}
+    """
+    features = cfg['features']['base']
+    data_dir = cfg['paths']['data']
+    data = {'__month__': month}
+    raw_cache = {}
+    for feat in features:
+        if feat == 'rain_mask':
+            if 'rain' not in raw_cache:
+                rain_path = os.path.join(data_dir, 'raw', month, 'rain.npy')
+                print(f"Trying to load: {rain_path}")
+                if not os.path.exists(rain_path):
+                    print(f"File missing: {rain_path}")
+                    raise FileNotFoundError(f"Missing file: {rain_path}")
+                raw_cache['rain'] = np.load(rain_path)
+            data[feat] = (raw_cache['rain'] > 0).astype(np.float32)
+            continue
+
+        path = os.path.join(data_dir, 'raw', month, f'{feat}.npy')
+        print(f"Trying to load: {path}")
+        if not os.path.exists(path):
+            print(f"File missing: {path}")
+            raise FileNotFoundError(f"Missing file: {path}")
+        try:
+            arr = np.load(path)  # (T, H, W)
+        except Exception as e:
+            print(f"Failed to load {path}: {e}")
+            raise
+        raw_cache[feat] = arr
+        data[feat] = preprocess_feature(arr, feat, bounds, month=month)
+        if feat == 'cpm25':
+            data['__cpm25_log1p__'] = _transform_feature_values(arr, 'cpm25').astype(np.float32)
+
+    if month.upper().startswith('DEC') and cfg.get('data', {}).get('december_grid_sigma_norm', True):
+        mu, sigma = _get_december_grid_stats(cfg)
+        data['__dec_mu__'] = mu
+        data['__dec_sigma__'] = sigma
+
+    for emis_feat in ('PM25', 'NOx', 'NH3', 'NMVOC_e'):
+        if emis_feat in data:
+            std = float(np.std(data[emis_feat]))
+            if std <= 0.0:
+                raise RuntimeError(f"Emission feature {emis_feat} collapsed to zero variance after preprocessing.")
+
+    if 'cpm25' not in data:
+        print(f"cpm25 missing in month {month}, skipping.")
+        return {}
+    T, H, W = data['cpm25'].shape
+    time_path = os.path.join(data_dir, 'raw', month, 'time.npy')
+    time_arr = np.load(time_path) if os.path.exists(time_path) else None
+    data.update(build_aux_feature_maps(cfg, time_arr, T, H, W))
+    return data
+
+
+def load_all_months(cfg, months: list, bounds: dict) -> list:
+    """
+    Load and normalize multiple months.  Returns a list of dicts (one per month).
+    Memory: ~750 MB per month × 16 features (140×124 grid, float32).
+    """
+    all_data = []
+    for m in months:
+        print(f"  Loading {m} ...", end=" ", flush=True)
+        all_data.append(_load_month(cfg, m, bounds))
+        print("OK")
+        gc.collect()
+    return all_data
+
+
+# ─────────────────────────────────────────────
+# PyTorch Dataset — Lazy Sliding Windows
+
+def make_dataloaders(cfg, tensor, bounds):
+    batch_size = cfg['training']['batch_size_train']
+    val_batch_size = cfg['training'].get('batch_size_val', batch_size)
+    window_size = cfg['time']['t_in']  # Use model input window size from config
+    t_out = cfg['time']['t_out']
+    val_split = cfg['data'].get('val_split', 0.1)
+
+    # Build windows from the full tensor first.
+    # t_in_cpm: masks future cpm25 hours (t_in_cpm:window_size) to zeros so
+    # training matches test-time conditions (only 10 observed hours available).
+    t_in_cpm = cfg['time'].get('t_in_cpm', 10)
+    full_ds = SlidingWindowTensorDataset(
+        tensor, window_size, t_out=t_out, target_channel=0, t_in_cpm=t_in_cpm
+    )
+
+    # ── Temporal firewall split (no random leakage) ─────────────────────────
+    # Use the LAST val_split windows of each month for validation, and exclude
+    # train windows within ±firewall_hours from the train/val boundary.
+    # This avoids adjacent-window leakage that can produce unrealistically low
+    # validation RMSE.
+    firewall_hours = int(cfg.get('data', {}).get('val_firewall_hours', 12))
+    n_months = full_ds.N
+    windows_per_month = full_ds.num_windows
+
+    train_indices = []
+    val_indices = []
+
+    for month_idx in range(n_months):
+        n_val_m = max(1, int(windows_per_month * val_split))
+        val_start = windows_per_month - n_val_m
+
+        # Validation block: tail windows in this month.
+        for w in range(val_start, windows_per_month):
+            val_indices.append(month_idx * windows_per_month + w)
+
+        # Training block: strictly before firewall boundary.
+        train_end = max(0, val_start - firewall_hours)
+        for w in range(0, train_end):
+            train_indices.append(month_idx * windows_per_month + w)
+
+    if len(train_indices) == 0 or len(val_indices) == 0:
+        raise ValueError(
+            "Temporal firewall split produced empty train/val set. "
+            "Reduce val_split or val_firewall_hours."
+        )
+
+    train_ds = Subset(full_ds, train_indices)
+    val_ds = Subset(full_ds, val_indices)
+
+    print(
+        f"Temporal split enabled: windows/month={windows_per_month}, "
+        f"val_split={val_split:.2f}, firewall={firewall_hours}h | "
+        f"train={len(train_ds):,}, val={len(val_ds):,}"
+    )
+
+    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_dl = DataLoader(val_ds, batch_size=val_batch_size, shuffle=False)
+    return train_dl, val_dl
+# ─────────────────────────────────────────────
+
+class PM25Dataset(Dataset):
+    """
+    Lazy sliding-window PM2.5 dataset.
+
+    Window logic (per EDA):
+    - Input  : met/emis[t : t+T_IN_MET]  — 26 hrs (10 past + 16 NWP forecast)
+               cpm25  [t : t+T_IN_CPM]   — 10 hrs known; hours 10-25 → 0.0
+    - Target : cpm25  [t+T_IN_CPM :
+                       t+T_IN_CPM+T_OUT]  — next 16 hrs (normalized)
+    Both input and target are in normalized [0, 1] space.
+
+    Output shapes
+    -------------
+    x : (C=input_channels, T_in=26, H=140, W=124)  float32
+    y : (H=140, W=124, T_out=16)        float32
+    """
+
+    def __init__(self, months_data: list, cfg: dict, stride: int):
+        self.data     = months_data   # list of {feat: (T, H, W) arrays}
+        self.feats    = cfg['features']['input']
+        self.t_in     = cfg['time']['t_in_met']    # 26
+        self.t_cpm    = cfg['time']['t_in_cpm']    # 10
+        self.t_out    = cfg['time']['t_out']        # 16
+        self.cpm_idx  = 0                           # cpm25 is always index 0
+        self.december_sigma_norm = bool(cfg.get('data', {}).get('december_grid_sigma_norm', True))
+
+        # Build (month_idx, start_t) index
+        self.index = []
+        window = self.t_cpm + self.t_out            # = 26 total consumed
+        for m_idx, mdata in enumerate(months_data):
+            T = mdata[self.feats[0]].shape[0]
+            for t in range(0, T - window + 1, stride):
+                self.index.append((m_idx, t))
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, idx):
+        m_idx, t = self.index[idx]
+        mdata     = self.data[m_idx]
+        t_in      = self.t_in
+        t_cpm     = self.t_cpm
+        t_out     = self.t_out
+
+        # ── Input tensor (C, T_in, H, W) ──
+        channels = []
+        for feat in self.feats:
+            chunk = mdata[feat][t : t + t_in].copy()  # (T_in, H, W)
+            if feat == 'cpm25':
+                month_name = str(mdata.get('__month__', '')).upper()
+                if self.december_sigma_norm and month_name.startswith('DEC') and '__cpm25_log1p__' in mdata:
+                    mu = mdata.get('__dec_mu__', None)
+                    sigma = mdata.get('__dec_sigma__', None)
+                    if mu is not None and sigma is not None:
+                        cpm_log_chunk = mdata['__cpm25_log1p__'][t : t + t_in].copy()
+                        chunk = ((cpm_log_chunk - mu[None, :, :]) / sigma[None, :, :]).astype(np.float32)
+                chunk[t_cpm:] = 0.0   # mask future cpm25 (not available at test time)
+            channels.append(chunk)
+        x = torch.from_numpy(np.stack(channels, axis=0))  # (C, T, H, W)
+
+        # ── Target (H, W, T_out) — normalized cpm25 ──
+        y_arr = mdata['cpm25'][t + t_cpm : t + t_cpm + t_out]  # (T_out, H, W)
+        y = torch.from_numpy(y_arr).permute(1, 2, 0)            # (H, W, T_out)
+
+        return x, y
+
+
+# ─────────────────────────────────────────────
+# DataLoaders
+# ─────────────────────────────────────────────
+
+def get_dataloaders(cfg, train_data: list, val_data: list, bounds: dict):
+    """
+    Build train + validation DataLoaders from pre-loaded month data.
+
+    Parameters
+    ----------
+    train_data, val_data : list of month dicts (from load_all_months)
+    bounds               : normalization bounds dict (for reference / denorm)
+
+    Returns
+    -------
+    train_dl, val_dl, bounds
+    """
+    train_ds = PM25Dataset(train_data, cfg, stride=cfg['time']['stride_train'])
+    val_ds   = PM25Dataset(val_data,   cfg, stride=cfg['time']['stride_val'])
+
+    print(f"  Train samples: {len(train_ds):,}  |  Val samples: {len(val_ds):,}")
+
+    train_dl = DataLoader(
+        train_ds,
+        batch_size  = cfg['training']['batch_size_train'],
+        shuffle     = True,
+        num_workers = cfg['training']['num_workers'],
+        pin_memory  = cfg['training'].get('pin_memory', True),
+        drop_last   = True,
+    )
+    val_dl = DataLoader(
+        val_ds,
+        batch_size  = cfg['training']['batch_size_val'],
+        shuffle     = False,
+        num_workers = cfg['training']['num_workers'],
+        pin_memory  = cfg['training'].get('pin_memory', True),
+    )
+    return train_dl, val_dl
+
+
+def build_test_input(cfg, bounds: dict, start: int = 0, end: int | None = None) -> np.ndarray:
+    """
+    Build normalized test tensor with auxiliary channels.
+
+    Parameters
+    ----------
+    start, end : int
+        Half-open index range [start, end). This enables memory-safe chunked
+        inference. If `end` is None, it defaults to `n_test`.
+
+    Returns
+    -------
+    X_test : (end-start, C=input_channels, T=26, H, W) float32
+    """
+    features  = cfg['features']['base']
+    input_feats = cfg['features']['input']
+    data_dir   = cfg['paths']['data']
+    t_in_cpm   = cfg['time']['t_in_cpm']
+    t_in_met   = cfg['time']['t_in_met']
+    n_test     = cfg['data']['test_samples']
+    if end is None:
+        end = n_test
+    if not (0 <= start < end <= n_test):
+        raise ValueError(f"Invalid test slice [{start}, {end}) for n_test={n_test}")
+    bs = end - start
+
+    base = {}
+    # NOTE: december_grid_sigma_norm is intentionally NOT applied here.
+    # Training used SlidingWindowTensorDataset which stores cpm25 with plain
+    # min-max log1p normalization for ALL months (including December).
+    # Applying December grid-wise sigma at test time would create a train/test
+    # mismatch and produce garbage predictions.
+
+    for feat in features:
+        if feat == 'rain_mask':
+            rain_path = os.path.join(data_dir, 'test_in', 'rain.npy')
+            rain_arr = np.load(rain_path, mmap_mode='r')[start:end]
+            base[feat] = (rain_arr > 0).astype(np.float32)
+            continue
+
+        path = os.path.join(data_dir, 'test_in', f'{feat}.npy')
+        arr = np.load(path, mmap_mode='r')[start:end]
+        if feat == 'cpm25':
+            # Standard min-max log1p normalization — matches SlidingWindowTensorDataset
+            cpm_proc = preprocess_feature(arr, feat, bounds, month=None)
+            # Fill unknown future cpm25 hours (t_in_cpm:) with ZEROS.
+            # SlidingWindowTensorDataset now zeros out these hours during training
+            # (xb[cpm_channel, t_in_cpm:] = 0.0), so inference must match.
+            # Using persistence previously created a train/test distribution mismatch.
+            n_fill   = t_in_met - t_in_cpm  # = 16
+            zeros    = np.zeros((bs, n_fill, *cpm_proc.shape[2:]), dtype=np.float32)
+            base[feat] = np.concatenate([cpm_proc, zeros], axis=1)  # (bs, 26, H, W)
+            continue
+        base[feat] = preprocess_feature(arr, feat, bounds, month=None)
+
+    sample_shape = next(iter(base.values())).shape
+    N, T, H, W = sample_shape
+
+    time_path = os.path.join(data_dir, 'test_in', 'time.npy')
+    time_arr = np.load(time_path) if os.path.exists(time_path) else None
+    if time_arr is None and cfg['features'].get('aux'):
+        print("Warning: test_in/time.npy not found. Calendar features fall back to neutral defaults at inference.")
+    aux_single = build_aux_feature_maps(cfg, time_arr, T, H, W)
+    aux = {k: np.broadcast_to(v[None], (bs, T, H, W)).copy() for k, v in aux_single.items()}
+
+    arrays = []
+    for feat in input_feats:
+        arrays.append(base[feat] if feat in base else aux[feat])
+    return np.stack(arrays, axis=1).astype(np.float32)
+
+
+# ─────────────────────────────────────────────
+# SimVPv2 feature builder + datasets
+# ─────────────────────────────────────────────
+
+def _build_igp_mask(H: int, W: int) -> np.ndarray:
+    """Binary Indo-Gangetic-Plain prior mask, broadcastable to (T,H,W)."""
+    mask = np.zeros((H, W), dtype=np.float32)
+    r0, r1 = 25, 60
+    c0, c1 = 30, 100
+    mask[r0:r1, c0:c1] = 1.0
+    return mask
+
+
+def _simvp_month_num(name: str) -> float:
+    return float(_month_num_from_name(name))
+
+
+def _safe_rh_from_t2_q2(t2: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    """Relative humidity proxy used in existing pipeline, stable in float32."""
+    denom_safe = np.where(
+        np.abs(t2 - np.float32(29.65)) < np.float32(1e-3),
+        np.sign(t2 - np.float32(29.65) + np.float32(1e-3)) * np.float32(1e-3),
+        t2 - np.float32(29.65),
+    ).astype(np.float32)
+    exponent = np.clip(
+        np.float32(17.67) * (t2 - np.float32(273.15)) / denom_safe,
+        np.float32(-87.0), np.float32(87.0),
+    )
+    with np.errstate(over='ignore', invalid='ignore'):
+        rh = q2 / (np.float32(0.622) + np.float32(0.378) * q2 + np.float32(1e-8)) * np.exp(exponent)
+    np.nan_to_num(rh, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    return np.clip(rh, np.float32(0.0), np.float32(1.5))
+
+
+def _build_simvp_channels_from_base(
+    base_window: np.ndarray,
+    feat_idx: dict,
+    t_in_cpm: int,
+    hotspot_map: np.ndarray,
+    month_num: float,
+) -> np.ndarray:
+    """
+    Build SimVP channels from normalized base window.
+
+    Parameters
+    ----------
+    base_window : (C_base, T, H, W)
+    Returns
+    -------
+    x : (T, C_simvp, H, W)
+    """
+    Cb, T, H, W = base_window.shape
+
+    def _get(name: str) -> np.ndarray:
+        idx = feat_idx.get(name, None)
+        if idx is None:
+            return np.zeros((T, H, W), dtype=np.float32)
+        return base_window[idx].astype(np.float32)
+
+    cpm25 = _get('cpm25').copy()
+    cpm25[t_in_cpm:] = 0.0
+
+    u10 = _get('u10')
+    v10 = _get('v10')
+    pblh = _get('pblh')
+    rain = _get('rain')
+    t2 = _get('t2')
+    q2 = _get('q2')
+    swdown = _get('swdown')
+    psfc = _get('psfc')
+
+    wind_speed = np.sqrt(u10 ** 2 + v10 ** 2).astype(np.float32)
+    wind_dir = np.arctan2(v10, u10).astype(np.float32)
+    rh = _safe_rh_from_t2_q2(t2, q2).astype(np.float32)
+
+    # Advection from masked cpm25; future steps naturally become near-zero.
+    dC_dh, dC_dw = np.gradient(cpm25, axis=(1, 2))
+    advection = (u10 * dC_dw + v10 * dC_dh).astype(np.float32)
+
+    PM25_emis = _get('PM25')
+    NOx = _get('NOx')
+    NH3 = _get('NH3')
+    NMVOC_e = _get('NMVOC_e')
+    NMVOC_finn = _get('NMVOC_finn')
+
+    hour = (np.arange(T, dtype=np.float32) % 24.0)
+    hour_sin = np.broadcast_to(np.sin(np.float32(2 * np.pi) * hour / np.float32(24.0)).reshape(T, 1, 1), (T, H, W)).copy()
+    hour_cos = np.broadcast_to(np.cos(np.float32(2 * np.pi) * hour / np.float32(24.0)).reshape(T, 1, 1), (T, H, W)).copy()
+    month_sin = np.full((T, H, W), np.sin(np.float32(2 * np.pi) * np.float32(month_num) / np.float32(12.0)), dtype=np.float32)
+    month_cos = np.full((T, H, W), np.cos(np.float32(2 * np.pi) * np.float32(month_num) / np.float32(12.0)), dtype=np.float32)
+
+    hotspot = np.broadcast_to(hotspot_map.reshape(1, H, W), (T, H, W)).copy().astype(np.float32)
+    igp = np.broadcast_to(_build_igp_mask(H, W).reshape(1, H, W), (T, H, W)).copy().astype(np.float32)
+
+    channels = [
+        cpm25,
+        t2, pblh, q2, u10, v10, swdown, psfc, rain,
+        wind_speed, wind_dir, rh, advection,
+        PM25_emis, NOx, NH3, NMVOC_e, NMVOC_finn,
+        hour_sin, hour_cos, month_sin, month_cos,
+        hotspot, igp,
+    ]
+    x = np.stack(channels, axis=1).astype(np.float32)  # (T, C, H, W)
+    np.nan_to_num(x, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    return x
+
+
+class SimVPWindowDataset(Dataset):
+    """Sliding-window dataset returning SimVP layout: x=(T,C,H,W), y=(T_out,1,H,W)."""
+
+    def __init__(
+        self,
+        tensor: np.ndarray,
+        feature_names: list[str],
+        window_size: int,
+        t_out: int,
+        t_in_cpm: int,
+        month_names: list[str] | None,
+        hotspot_map: np.ndarray,
+    ):
+        self.tensor = np.asarray(tensor, dtype=np.float32)          # (N, C_base, T, H, W)
+        self.feature_names = list(feature_names)
+        self.feat_idx = {name: i for i, name in enumerate(self.feature_names)}
+        self.window_size = int(window_size)
+        self.t_out = int(t_out)
+        self.t_in_cpm = int(t_in_cpm)
+        self.month_names = month_names if month_names is not None else ["JAN"] * self.tensor.shape[0]
+        self.hotspot_map = np.asarray(hotspot_map, dtype=np.float32)
+
+        self.N, self.Cb, self.T, self.H, self.W = self.tensor.shape
+        self.num_windows = self.T - self.window_size - self.t_out + 1
+        if self.num_windows <= 0:
+            raise ValueError(
+                f"Not enough time steps for SimVP windows: T={self.T}, "
+                f"t_in={self.window_size}, t_out={self.t_out}."
+            )
+        self.total = self.N * self.num_windows
+
+        if 'cpm25' not in self.feat_idx:
+            raise KeyError("SimVP dataset requires 'cpm25' in feature_names")
+        self.cpm_idx = self.feat_idx['cpm25']
+
+    def __len__(self):
+        return self.total
+
+    def __getitem__(self, idx):
+        n = idx // self.num_windows
+        w = idx % self.num_windows
+
+        xb_base = self.tensor[n, :, w:w + self.window_size, :, :]  # (C_base, T_in, H, W)
+        month_num = _simvp_month_num(self.month_names[n])
+        xb = _build_simvp_channels_from_base(
+            xb_base,
+            feat_idx=self.feat_idx,
+            t_in_cpm=self.t_in_cpm,
+            hotspot_map=self.hotspot_map,
+            month_num=month_num,
+        )  # (T_in, C_simvp, H, W)
+
+        y_start = w + self.window_size
+        y_end = y_start + self.t_out
+        y = self.tensor[n, self.cpm_idx, y_start:y_end, :, :]      # (T_out, H, W)
+        y = y[:, None, :, :]                                        # (T_out, 1, H, W)
+
+        return torch.from_numpy(xb), torch.from_numpy(y.astype(np.float32))
+
+
+def make_simvp_dataloaders(
+    cfg: dict,
+    tensor: np.ndarray,
+    feature_names: list[str],
+    month_names: list[str] | None = None,
+):
+    """Leak-resistant dataloaders for SimVP with temporal firewall split."""
+    batch_size = cfg['training']['batch_size_train']
+    val_batch_size = cfg['training'].get('batch_size_val', batch_size)
+    t_in = int(cfg['time'].get('t_in', 16))
+    t_out = int(cfg['time'].get('t_out', 16))
+    t_in_cpm = int(cfg['time'].get('t_in_cpm', 10))
+    val_split = float(cfg['data'].get('val_split', 0.15))
+    firewall_hours = int(cfg['data'].get('val_firewall_hours', 12))
+
+    hotspot, _ = get_hotspot_maps(cfg)
+    full_ds = SimVPWindowDataset(
+        tensor=tensor,
+        feature_names=feature_names,
+        window_size=t_in,
+        t_out=t_out,
+        t_in_cpm=t_in_cpm,
+        month_names=month_names,
+        hotspot_map=hotspot,
+    )
+
+    n_months = full_ds.N
+    windows_per_month = full_ds.num_windows
+    train_indices = []
+    val_indices = []
+
+    for month_idx in range(n_months):
+        n_val_m = max(1, int(windows_per_month * val_split))
+        val_start = windows_per_month - n_val_m
+        for w in range(val_start, windows_per_month):
+            val_indices.append(month_idx * windows_per_month + w)
+        train_end = max(0, val_start - firewall_hours)
+        for w in range(0, train_end):
+            train_indices.append(month_idx * windows_per_month + w)
+
+    if len(train_indices) == 0 or len(val_indices) == 0:
+        raise ValueError(
+            "Temporal firewall split produced empty train/val set. "
+            "Reduce val_split or val_firewall_hours."
+        )
+
+    train_ds = Subset(full_ds, train_indices)
+    val_ds = Subset(full_ds, val_indices)
+
+    print(
+        f"SimVP temporal split: windows/month={windows_per_month}, "
+        f"val_split={val_split:.2f}, firewall={firewall_hours}h | "
+        f"train={len(train_ds):,}, val={len(val_ds):,}"
+    )
+
+    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_dl = DataLoader(val_ds, batch_size=val_batch_size, shuffle=False)
+    return train_dl, val_dl
+
+
+def build_simvp_test_chunk(
+    cfg: dict,
+    bounds: dict,
+    feature_names: list[str],
+    start: int,
+    end: int,
+) -> np.ndarray:
+    """
+    Build SimVP inference chunk in layout (B, T_in, C_simvp, H, W).
+    """
+    t_in = int(cfg['time'].get('t_in', 16))
+    t_in_cpm = int(cfg['time'].get('t_in_cpm', 10))
+    data_dir = cfg['paths']['data']
+    test_dir = os.path.join(data_dir, 'test_in')
+    bs = end - start
+
+    base = {}
+    for feat in feature_names:
+        if feat == 'rain_mask':
+            rain = np.load(os.path.join(test_dir, 'rain.npy'), mmap_mode='r')[start:end]
+            arr = (np.asarray(rain, dtype=np.float32) > 0).astype(np.float32)
+            base[feat] = arr[:, :t_in]
+            continue
+
+        raw = np.load(os.path.join(test_dir, f'{feat}.npy'), mmap_mode='r')[start:end]
+        raw = np.asarray(raw, dtype=np.float32)
+        if feat == 'cpm25':
+            cpm = preprocess_feature(raw, feat, bounds, month=None)
+            if cpm.shape[1] >= t_in:
+                cpm = cpm[:, :t_in]
+            else:
+                fill = np.zeros((bs, t_in - cpm.shape[1], cpm.shape[2], cpm.shape[3]), dtype=np.float32)
+                cpm = np.concatenate([cpm, fill], axis=1)
+            cpm[:, t_in_cpm:] = 0.0
+            base[feat] = cpm
+        else:
+            arr = preprocess_feature(raw, feat, bounds, month=None)
+            base[feat] = arr[:, :t_in]
+
+    feat_idx = {name: i for i, name in enumerate(feature_names)}
+    Cb = len(feature_names)
+    H, W = next(iter(base.values())).shape[-2:]
+    base_tensor = np.empty((bs, Cb, t_in, H, W), dtype=np.float32)
+    for i, feat in enumerate(feature_names):
+        base_tensor[:, i] = base[feat]
+
+    hotspot, _ = get_hotspot_maps(cfg)
+    month_num = 1.0
+    out = []
+    for b in range(bs):
+        x = _build_simvp_channels_from_base(
+            base_window=base_tensor[b],
+            feat_idx=feat_idx,
+            t_in_cpm=t_in_cpm,
+            hotspot_map=hotspot,
+            month_num=month_num,
+        )
+        out.append(x)
+    return np.stack(out, axis=0).astype(np.float32)
+
+
+# ─────────────────────────────────────────────
+# Legacy helpers (kept for compatibility)
+# ─────────────────────────────────────────────
+
+def compute_stats(cfg, months):
+    """Deprecated: use load_minmax_bounds instead."""
+    raise DeprecationWarning(
+        "compute_stats is removed. Use load_minmax_bounds(cfg) for official "
+        "min-max normalization from feat_min_max.mat."
+    )
+
+
+def save_stats(stats, path):
+    np.save(path, stats)
+
+
+def load_stats(path):
+    return np.load(path, allow_pickle=True).item()
+
