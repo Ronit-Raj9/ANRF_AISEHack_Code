@@ -99,9 +99,14 @@ def add_physical_features(tensor, features_dict=None, lat_long_path='lat_long.np
     denom_safe = np.where(np.abs(t2 - 29.65) < 1e-3,
                           np.sign(t2 - 29.65 + np.float32(1e-3)) * np.float32(1e-3),
                           t2 - np.float32(29.65)).astype(np.float32)
-    exponent = np.clip(np.float32(17.67) * (t2 - np.float32(273.15)) / denom_safe,
-                       np.float32(-100.0), np.float32(100.0))
-    rh = q2 / (np.float32(0.622) + np.float32(0.378) * q2 + np.float32(1e-8)) * np.exp(exponent)
+    exponent = np.clip(
+        np.float32(17.67) * (t2 - np.float32(273.15)) / denom_safe,
+        np.float32(-87.0),
+        np.float32(87.0),
+    )
+    with np.errstate(over='ignore', invalid='ignore'):
+        rh = q2 / (np.float32(0.622) + np.float32(0.378) * q2 + np.float32(1e-8)) * np.exp(exponent)
+    np.nan_to_num(rh, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
     out[:, ch] = np.clip(rh, np.float32(0.0), np.float32(1.5))
     ch += 1
     del t2, q2, denom_safe, exponent, rh
