@@ -345,28 +345,44 @@ class _FNOBlock(nn.Module):
 
 
 class TFNO2D(nn.Module):
-    """Tucker-factorized FNO2D.  Same interface as UNet."""
+    """Tucker-factorized FNO2D.  Same interface as UNet.
+
+    Enhancements vs baseline:
+    - Reflective boundary padding (topic 7) pads from 140×124 → 144×128 before
+      spectral layers then crops back.  This prevents the FFT periodic assumption
+      from introducing spectral leakage at the edges of India.
+    - ``clamp_output=False`` when residual prediction is used (topic 8).
+    """
 
     def __init__(self, in_channels: int, out_steps: int = 16,
-                 width: int = 64, modes: int = 24, depth: int = 6, padding_mode: str = 'circular'):
+                 width: int = 64, modes: int = 24, depth: int = 6,
+                 padding_mode: str = 'circular',
+                 clamp_output: bool = True):
         super().__init__()
-        self.lift   = nn.Conv2d(in_channels, width, 1, padding_mode=padding_mode)
+        self.clamp_output = clamp_output
+        # Padding sizes to bring 140→144 and 124→128 (multiples of 8 / power-of-2)
+        self._pad = (2, 2, 2, 2)   # (left, right, top, bottom) for F.pad
+        self.lift   = nn.Conv2d(in_channels, width, 1)
         self.blocks = nn.ModuleList([_FNOBlock(width, modes) for _ in range(depth)])
         self.proj   = nn.Sequential(
-            nn.Conv2d(width, width * 2, 1, padding_mode=padding_mode), nn.GELU(),
-            nn.Conv2d(width * 2, out_steps, 1, padding_mode=padding_mode),
+            nn.Conv2d(width, width * 2, 1), nn.GELU(),
+            nn.Conv2d(width * 2, out_steps, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, T, H, W = x.shape
         x = x.reshape(B, C * T, H, W)
+        # ── Reflective padding (Topic 7): smooth boundary for FFT periodicity ──
+        x = F.pad(x, self._pad, mode='reflect')        # (B, C*T, H+4, W+4)
         x = self.lift(x)
         for block in self.blocks:
             x = block(x)
-        x = self.proj(x)                  # (B, T_out, H, W)
-        x = torch.clamp(x, 0.0, 1.0)      # keep preds in normalized [0,1] — prevents negative
-                                           # PM2.5 predictions wasting gradient budget
-        return x.permute(0, 2, 3, 1)      # (B, H, W, T_out)
+        x = self.proj(x)                               # (B, T_out, H+4, W+4)
+        # Crop back to original spatial dims
+        x = x[:, :, 2:2+H, 2:2+W]                     # (B, T_out, H, W)
+        if self.clamp_output:
+            x = torch.clamp(x, 0.0, 1.0)
+        return x.permute(0, 2, 3, 1)                   # (B, H, W, T_out)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -411,12 +427,16 @@ def build_model(cfg) -> nn.Module:
             base_ch     = cfg['model'].get('base_ch', 64),
         )
     elif mtype in ('tfno2d', 'fno2d'):
+        # Disable output clamp when residual prediction is used (z-scores / deltas
+        # are unbounded; clamping to [0,1] would cut negative residuals).
+        residual_mode = cfg.get('training', {}).get('residual_target', False)
         model = MODEL_REGISTRY[mtype](
-            in_channels = in_channels,
-            out_steps   = t_out,
-            width       = cfg['model']['width'],
-            modes       = cfg['model']['modes'],
-            depth       = cfg['model']['depth'],
+            in_channels  = in_channels,
+            out_steps    = t_out,
+            width        = cfg['model']['width'],
+            modes        = cfg['model']['modes'],
+            depth        = cfg['model']['depth'],
+            clamp_output = not residual_mode,
         )
     elif mtype == 'res_stunet':
         model = MODEL_REGISTRY[mtype](

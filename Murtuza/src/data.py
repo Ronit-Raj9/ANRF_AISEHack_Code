@@ -105,7 +105,8 @@ def add_physical_features(tensor, features_dict=None, lat_long_path='lat_long.np
     # ── Normalise dtype to float32 immediately ───────────────────────────────
     tensor = np.asarray(tensor, dtype=np.float32)
     N, C, T, H, W = tensor.shape
-    N_ENG = 11
+    N_ENG = 12   # wind_speed, wind_dir, ventilation_idx, rh, hour_sin, hour_cos,
+                 # month_sin, month_cos, hotspot, lag_1, lag_3, lag_6
 
     # Pre-allocate output: (N, C+N_ENG, T, H, W) float32
     out = np.empty((N, C + N_ENG, T, H, W), dtype=np.float32)
@@ -115,13 +116,21 @@ def add_physical_features(tensor, features_dict=None, lat_long_path='lat_long.np
     # ── Wind speed ──────────────────────────────────────────────────────────
     u10 = tensor[:, features_dict['u10'], :, :, :]   # (N,T,H,W) view, float32
     v10 = tensor[:, features_dict['v10'], :, :, :]
-    out[:, ch] = np.sqrt(u10 ** 2 + v10 ** 2)
+    wind_speed = np.sqrt(u10 ** 2 + v10 ** 2)
+    out[:, ch] = wind_speed
     ch += 1
 
     # ── Wind direction ───────────────────────────────────────────────────────
     out[:, ch] = np.arctan2(v10, u10)
     ch += 1
-    del u10, v10
+
+    # ── Ventilation Index = PBLH × wind_speed (Topic 6) ─────────────────────
+    # Captures the joint dispersal capacity: high PBLH AND strong winds
+    # both needed to ventilate the boundary layer of pollution.
+    pblh = tensor[:, features_dict['pblh'], :, :, :]   # (N,T,H,W)
+    out[:, ch] = pblh * wind_speed
+    ch += 1
+    del u10, v10, pblh, wind_speed
     gc.collect()
 
     # ── Relative humidity ────────────────────────────────────────────────────
@@ -305,11 +314,177 @@ EMIS_LOG_EPS_FEATURES = {'PM25', 'NOx', 'NH3', 'NMVOC_e', 'SO2', 'bio'}
 MASK_ONLY_FEATURES = {'NMVOC_finn'}
 LOG_EPS = np.float32(1e-12)
 DEC_STD_EPS = np.float32(1e-6)
-_DECEMBER_STATS_CACHE: dict[tuple[str, str], tuple[np.ndarray, np.ndarray]] = {}
-_HOTSPOT_MAP_CACHE: dict[tuple[str, tuple[str, ...], int], tuple[np.ndarray, np.ndarray]] = {}
+
+# ────────────────────────────────────────────────────────────────────────────
+# Grid-Wise Pixel Normalization  (Topic 2 of Ronit's preprocessing plan)
+# ────────────────────────────────────────────────────────────────────────────
+
+def compute_pixel_stats(cfg: dict, months: list, bounds: dict) -> dict:
+    """
+    Compute per-pixel (H, W) mean and std for each feature after log-transform,
+    using training months only (pass cfg['data']['train_months']).
+
+    Returns
+    -------
+    pixel_stats : dict  {feat: {'mu': (H, W) float32, 'sigma': (H, W) float32}}
+    """
+    import gc
+    features = cfg['features']['all']          # base features (no mask suffixes)
+    data_dir = cfg['paths']['data']
+
+    H, W = None, None
+    sum_map: dict[str, np.ndarray] = {}
+    sq_sum_map: dict[str, np.ndarray] = {}
+    count = 0
+
+    for month in months:
+        print(f"  Computing pixel stats for {month} ...", end=" ", flush=True)
+        for feat in features:
+            # Skip binary indicators — they are kept as 0/1 and don't need pixel z-score
+            if feat in MASK_ONLY_FEATURES or feat == 'rain_mask' or feat.endswith('_mask'):
+                continue
+            path = os.path.join(data_dir, 'raw', month, f'{feat}.npy')
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Missing file for pixel stats: {path}")
+            arr = np.load(path).astype(np.float32)   # (T, H, W)
+            if H is None:
+                H, W = arr.shape[1], arr.shape[2]
+            x_log = _transform_feature_values(arr, feat)   # (T, H, W)
+            if feat not in sum_map:
+                sum_map[feat]    = np.zeros((H, W), dtype=np.float64)
+                sq_sum_map[feat] = np.zeros((H, W), dtype=np.float64)
+            sum_map[feat]    += x_log.sum(axis=0).astype(np.float64)
+            sq_sum_map[feat] += (x_log.astype(np.float64) ** 2).sum(axis=0)
+            del arr, x_log
+            gc.collect()
+
+        # Count T from the first real feature this month
+        first_feat = next(f for f in features if f != 'rain_mask')
+        T_month = np.load(
+            os.path.join(data_dir, 'raw', month, f'{first_feat}.npy'),
+            mmap_mode='r',
+        ).shape[0]
+        count += T_month
+        print("OK")
+
+    pixel_stats: dict = {}
+    N = float(count)
+    for feat in features:
+        if feat == 'rain_mask':
+            continue
+        mu       = (sum_map[feat] / N).astype(np.float32)
+        variance = np.maximum(
+            sq_sum_map[feat] / N - (sum_map[feat] / N) ** 2,
+            0.0,
+        ).astype(np.float32)
+        sigma = np.maximum(np.sqrt(variance + 1e-12), np.float32(1e-6)).astype(np.float32)
+        pixel_stats[feat] = {'mu': mu, 'sigma': sigma}
+
+    print(f"Pixel stats computed from {len(months)} months, {int(count)} time steps, grid ({H},{W}).")
+    return pixel_stats
 
 
-def get_hotspot_maps(cfg: dict) -> tuple[np.ndarray, np.ndarray]:
+def save_pixel_stats(pixel_stats: dict, path: str) -> None:
+    """Save pixel stats dict to a .npz file."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    flat: dict = {}
+    for feat, d in pixel_stats.items():
+        if isinstance(d, dict):
+            flat[f'{feat}__mu']    = d['mu']
+            flat[f'{feat}__sigma'] = d['sigma']
+        else:
+            flat[feat] = d
+    np.savez(path, **flat)
+    print(f"Pixel stats saved → {path}")
+
+
+def load_pixel_stats(path: str) -> dict:
+    """Load pixel stats from a .npz file produced by save_pixel_stats."""
+    data = np.load(path)
+    pixel_stats: dict = {}
+    for key in data.files:
+        if key.endswith('__mu'):
+            feat = key[:-4]
+            pixel_stats.setdefault(feat, {})['mu'] = data[key]
+        elif key.endswith('__sigma'):
+            feat = key[:-7]
+            pixel_stats.setdefault(feat, {})['sigma'] = data[key]
+        else:
+            pixel_stats[key] = data[key]
+    return pixel_stats
+
+
+def preprocess_feature_pixelwise(arr: np.ndarray, feat: str, pixel_stats: dict) -> np.ndarray:
+    """
+    Log-transform + per-pixel z-score normalization (Topic 2).
+
+    Parameters
+    ----------
+    arr : (T, H, W) raw feature array
+    feat : feature name
+    pixel_stats : dict from compute_pixel_stats / load_pixel_stats
+
+    Returns
+    -------
+    z_norm : (T, H, W) float32  — per-pixel z-scores
+    """
+    if feat == 'rain_mask':
+        return (arr > 0).astype(np.float32)
+    x_log = _transform_feature_values(arr, feat).astype(np.float64)   # (T, H, W)
+    if feat not in pixel_stats or not isinstance(pixel_stats[feat], dict):
+        # graceful fallback: global z-score
+        mu    = float(x_log.mean())
+        sigma = max(float(x_log.std()), 1e-6)
+        return ((x_log - mu) / sigma).astype(np.float32)
+    mu    = pixel_stats[feat]['mu'].astype(np.float64)     # (H, W)
+    sigma = pixel_stats[feat]['sigma'].astype(np.float64)  # (H, W)
+    return ((x_log - mu[None]) / sigma[None]).astype(np.float32)
+
+
+def denormalize_pixelwise(arr: np.ndarray, feat: str, pixel_stats: dict) -> np.ndarray:
+    """
+    Inverse of per-pixel z-score normalization → physical values.
+
+    Parameters
+    ----------
+    arr : (..., H, W, T) or (B, H, W, T) predicted z-scores
+    feat : feature name (default use-case: 'cpm25')
+    pixel_stats : dict from load_pixel_stats
+
+    Returns
+    -------
+    physical : same shape as arr, dtype float32
+    """
+    if feat not in pixel_stats or not isinstance(pixel_stats[feat], dict):
+        return arr.astype(np.float32)
+    mu    = pixel_stats[feat]['mu'].astype(np.float32)     # (H, W)
+    sigma = pixel_stats[feat]['sigma'].astype(np.float32)  # (H, W)
+    arr   = np.asarray(arr, dtype=np.float32)
+    # Broadcast: support (B, H, W, T) with mu/sigma (H, W)
+    if arr.ndim == 4:
+        x_log = arr * sigma[None, :, :, None] + mu[None, :, :, None]
+    elif arr.ndim == 3:
+        x_log = arr * sigma[:, :, None] + mu[:, :, None]
+    else:
+    Log-transform + per-pixel z-score normalization (Topic 2).
+
+    Binary-mask features (rain_mask, NMVOC_finn) are exempt — they stay as
+    0/1 indicators because z-scoring a near-binary signal destroys its
+    sparsity semantics and inflates outlier steps.
+
+    Parameters
+    ----------
+    arr : (T, H, W) raw feature array
+    feat : feature name
+    pixel_stats : dict from compute_pixel_stats / load_pixel_stats
+
+    Returns
+    -------
+    z_norm : (T, H, W) float32  — per-pixel z-scores (or 0/1 binary mask)
+
+    # Binary/mask features stay as 0/1 — do NOT z-score them
+    if feat in MASK_ONLY_FEATURES or feat == 'rain_mask' or feat.endswith('_mask'):
+        return (np.asarray(arr, dtype=np.float32) > 0).astype(np.float32)
     """
     Build hotspot climatology prior and spatial loss-weight map from raw cpm25.
 
@@ -517,9 +692,12 @@ def build_aux_feature_maps(cfg, time_arr: np.ndarray | None, T: int, H: int, W: 
 # Month-level Data Loading
 # ─────────────────────────────────────────────
 
-def _load_month(cfg, month: str, bounds: dict) -> dict:
+def _load_month(cfg, month: str, bounds: dict, pixel_stats: dict | None = None) -> dict:
     """
     Load and normalize all features for one month.
+
+    When pixel_stats is provided (and cfg['data']['use_pixel_norm'] is True),
+    applies per-pixel z-score normalization (Topic 2) instead of global min-max.
 
     Returns
     -------
@@ -527,6 +705,10 @@ def _load_month(cfg, month: str, bounds: dict) -> dict:
     """
     features = cfg['features']['base']
     data_dir = cfg['paths']['data']
+    use_pixel_norm = (
+        pixel_stats is not None
+        and cfg.get('data', {}).get('use_pixel_norm', False)
+    )
     data = {'__month__': month}
     raw_cache = {}
     for feat in features:
@@ -552,19 +734,33 @@ def _load_month(cfg, month: str, bounds: dict) -> dict:
             print(f"Failed to load {path}: {e}")
             raise
         raw_cache[feat] = arr
-        data[feat] = preprocess_feature(arr, feat, bounds, month=month)
+
+        if use_pixel_norm:
+            data[feat] = preprocess_feature_pixelwise(arr, feat, pixel_stats)
+        else:
+            data[feat] = preprocess_feature(arr, feat, bounds, month=month)
+
         if feat == 'cpm25':
             data['__cpm25_log1p__'] = _transform_feature_values(arr, 'cpm25').astype(np.float32)
 
-    if month.upper().startswith('DEC') and cfg.get('data', {}).get('december_grid_sigma_norm', True):
+    # December per-grid sigma norm is superseded by full pixel normalization;
+    # only apply it when pixel_norm is disabled.
+    if (
+        not use_pixel_norm
+        and month.upper().startswith('DEC')
+        and cfg.get('data', {}).get('december_grid_sigma_norm', True)
+    ):
         mu, sigma = _get_december_grid_stats(cfg)
         data['__dec_mu__'] = mu
         data['__dec_sigma__'] = sigma
 
+    # Sanity: emission z-scores must have non-zero variance
+    # (Only meaningful for global min-max norm; skip for pixel norm to avoid
+    # false positives from near-zero z-score ranges near the grid boundary.)
     for emis_feat in ('PM25', 'NOx', 'NH3', 'NMVOC_e'):
         if emis_feat in data:
             std = float(np.std(data[emis_feat]))
-            if std <= 0.0:
+            if not use_pixel_norm and std <= 0.0:
                 raise RuntimeError(f"Emission feature {emis_feat} collapsed to zero variance after preprocessing.")
 
     if 'cpm25' not in data:
@@ -577,15 +773,17 @@ def _load_month(cfg, month: str, bounds: dict) -> dict:
     return data
 
 
-def load_all_months(cfg, months: list, bounds: dict) -> list:
+def load_all_months(cfg, months: list, bounds: dict, pixel_stats: dict | None = None) -> list:
     """
     Load and normalize multiple months.  Returns a list of dicts (one per month).
     Memory: ~750 MB per month × 16 features (140×124 grid, float32).
+
+    When pixel_stats is provided the per-pixel z-score path (Topic 2) is used.
     """
     all_data = []
     for m in months:
         print(f"  Loading {m} ...", end=" ", flush=True)
-        all_data.append(_load_month(cfg, m, bounds))
+        all_data.append(_load_month(cfg, m, bounds, pixel_stats=pixel_stats))
         print("OK")
         gc.collect()
     return all_data
@@ -761,39 +959,41 @@ def get_dataloaders(cfg, train_data: list, val_data: list, bounds: dict):
     return train_dl, val_dl
 
 
-def build_test_input(cfg, bounds: dict, start: int = 0, end: int | None = None) -> np.ndarray:
+def build_test_input(cfg, bounds: dict, start: int = 0, end: int | None = None,
+                     pixel_stats: dict | None = None) -> np.ndarray:
     """
     Build normalized test tensor with auxiliary channels.
 
     Parameters
     ----------
     start, end : int
-        Half-open index range [start, end). This enables memory-safe chunked
-        inference. If `end` is None, it defaults to `n_test`.
+        Half-open index range [start, end). Enables memory-safe chunked inference.
+    pixel_stats : dict, optional
+        When provided and cfg['data']['use_pixel_norm'] is True, applies per-pixel
+        z-score normalization (Topic 2) instead of global min-max.
 
     Returns
     -------
     X_test : (end-start, C=input_channels, T=26, H, W) float32
     """
-    features  = cfg['features']['base']
+    features    = cfg['features']['base']
     input_feats = cfg['features']['input']
-    data_dir   = cfg['paths']['data']
-    t_in_cpm   = cfg['time']['t_in_cpm']
-    t_in_met   = cfg['time']['t_in_met']
-    n_test     = cfg['data']['test_samples']
+    data_dir    = cfg['paths']['data']
+    t_in_cpm    = cfg['time']['t_in_cpm']
+    t_in_met    = cfg['time']['t_in_met']
+    n_test      = cfg['data']['test_samples']
     if end is None:
         end = n_test
     if not (0 <= start < end <= n_test):
         raise ValueError(f"Invalid test slice [{start}, {end}) for n_test={n_test}")
     bs = end - start
 
-    base = {}
-    # NOTE: december_grid_sigma_norm is intentionally NOT applied here.
-    # Training used SlidingWindowTensorDataset which stores cpm25 with plain
-    # min-max log1p normalization for ALL months (including December).
-    # Applying December grid-wise sigma at test time would create a train/test
-    # mismatch and produce garbage predictions.
+    use_pixel_norm = (
+        pixel_stats is not None
+        and cfg.get('data', {}).get('use_pixel_norm', False)
+    )
 
+    base = {}
     for feat in features:
         if feat == 'rain_mask':
             rain_path = os.path.join(data_dir, 'test_in', 'rain.npy')
@@ -803,18 +1003,23 @@ def build_test_input(cfg, bounds: dict, start: int = 0, end: int | None = None) 
 
         path = os.path.join(data_dir, 'test_in', f'{feat}.npy')
         arr = np.load(path, mmap_mode='r')[start:end]
+
         if feat == 'cpm25':
-            # Standard min-max log1p normalization — matches SlidingWindowTensorDataset
-            cpm_proc = preprocess_feature(arr, feat, bounds, month=None)
+            if use_pixel_norm:
+                cpm_proc = preprocess_feature_pixelwise(arr, feat, pixel_stats)
+            else:
+                # Standard min-max log1p normalization — matches SlidingWindowTensorDataset
+                cpm_proc = preprocess_feature(arr, feat, bounds, month=None)
             # Fill unknown future cpm25 hours (t_in_cpm:) with ZEROS.
-            # SlidingWindowTensorDataset now zeros out these hours during training
-            # (xb[cpm_channel, t_in_cpm:] = 0.0), so inference must match.
-            # Using persistence previously created a train/test distribution mismatch.
-            n_fill   = t_in_met - t_in_cpm  # = 16
-            zeros    = np.zeros((bs, n_fill, *cpm_proc.shape[2:]), dtype=np.float32)
-            base[feat] = np.concatenate([cpm_proc, zeros], axis=1)  # (bs, 26, H, W)
+            n_fill  = t_in_met - t_in_cpm
+            zeros   = np.zeros((bs, n_fill, *cpm_proc.shape[2:]), dtype=np.float32)
+            base[feat] = np.concatenate([cpm_proc, zeros], axis=1)
             continue
-        base[feat] = preprocess_feature(arr, feat, bounds, month=None)
+
+        if use_pixel_norm:
+            base[feat] = preprocess_feature_pixelwise(arr, feat, pixel_stats)
+        else:
+            base[feat] = preprocess_feature(arr, feat, bounds, month=None)
 
     sample_shape = next(iter(base.values())).shape
     N, T, H, W = sample_shape

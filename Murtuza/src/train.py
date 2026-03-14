@@ -126,17 +126,26 @@ def get_optimizer(cfg, model, steps_per_epoch):
 # ─────────────────────────────────────────────
 # PINO Physics-Informed Loss
 # ─────────────────────────────────────────────
-def compute_physics_loss(pred, xb, yb, cfg):
+def compute_physics_loss(pred, xb, yb, cfg, residual_mode: bool = False):
     """
     Compute Advection-Diffusion residual for PINO:
     R = dC/dt + u · grad(C) - kappa * laplacian(C) - S
     Penalize squared residual.
+
+    When residual_mode=True (Topic 8), ``pred`` is a delta (Δ concentration),
+    so we reconstruct the absolute prediction before computing gradients.
     """
     import torch
 
     # Expected layout for PINO forward output: (B, H, W, T_out)
     if pred.ndim != 4:
         return torch.zeros((), device=pred.device, dtype=pred.dtype)
+
+    # When model predicts residuals, reconstruct absolute concentration map
+    if residual_mode:
+        t_in_cpm = cfg['time']['t_in_cpm']
+        last_obs = xb[:, 0, t_in_cpm - 1, :, :].unsqueeze(-1)  # (B, H, W, 1)
+        pred = last_obs + pred  # convert to absolute normalized space
 
     # Temporal derivative against last observed cpm25 (channel 0 at last input step)
     dt = 1.0
@@ -237,6 +246,7 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
     grad_clip = cfg['training']['grad_clip']
     save_path = cfg['paths']['model_save']
     t_in_cpm  = cfg['time']['t_in_cpm']
+    residual_mode = cfg['training'].get('residual_target', False)
 
     # cpm25 range for physical RMSE estimation
     cpm_range = None
@@ -253,6 +263,8 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
 
     print(f"\n{'─'*60}")
     print(f"  Persistence gate  (normalized RMSE): {PERSISTENCE_RMSE_NORM:.4f}")
+    if residual_mode:
+        print("  Residual-target mode ON (Topic 8): model predicts delta from last obs")
     if spatial_weight_map is not None:
         print("  Training loss uses hotspot-weighted spatial RMSE (val remains unweighted)")
     if cpm_range:
@@ -277,14 +289,25 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
             xb, yb = xb.to(device), yb.to(device)
             pred   = model(xb)
             sw = spatial_weight_map.to(pred.dtype) if spatial_weight_map is not None else None
-            data_loss = objective_loss(pred, yb, cfg, spatial_weights=sw)
-            physics_loss = compute_physics_loss(pred, xb, yb, cfg)
+
+            if residual_mode:
+                # Topic 8: train on delta from last observed cpm25 (z-score space)
+                last_obs = xb[:, 0, t_in_cpm - 1, :, :]          # (B, H, W)
+                target_for_loss = yb - last_obs.unsqueeze(-1)      # (B, H, W, T_out) residual
+                data_loss = objective_loss(pred, target_for_loss, cfg, spatial_weights=sw)
+                # For plain RMSE tracking, reconstruct absolute pred to report
+                pred_abs = last_obs.unsqueeze(-1) + pred
+                rmse_metric = rmse_loss_plain(pred_abs, yb)
+            else:
+                data_loss   = objective_loss(pred, yb, cfg, spatial_weights=sw)
+                rmse_metric = rmse_loss_plain(pred, yb)
+
+            physics_loss = compute_physics_loss(pred, xb, yb, cfg, residual_mode=residual_mode)
             loss = lambda_d * data_loss + lambda_p * physics_loss
             # Skip batch if loss is NaN/Inf (bad inputs slipping through)
             if not torch.isfinite(loss):
                 optimizer.zero_grad()
                 continue
-            rmse_metric = rmse_loss_plain(pred, yb)
 
             optimizer.zero_grad()
             loss.backward()
@@ -302,7 +325,12 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
             for xb, yb in val_dl:
                 xb, yb = xb.to(device), yb.to(device)
                 pred   = model(xb)
-                val_losses.append(rmse_loss_plain(pred, yb).item())
+                if residual_mode:
+                    last_obs = xb[:, 0, t_in_cpm - 1, :, :]
+                    pred_abs = last_obs.unsqueeze(-1) + pred
+                else:
+                    pred_abs = pred
+                val_losses.append(rmse_loss_plain(pred_abs, yb).item())
                 val_persist.append(persistence_rmse_from_batch(xb, yb, t_in_cpm).item())
 
         train_objective = float(np.mean(epoch_losses))

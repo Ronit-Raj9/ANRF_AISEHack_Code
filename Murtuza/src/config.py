@@ -77,14 +77,20 @@ def load_config(config_path: str = None) -> dict:
         local_out = _os.path.abspath(
             _os.path.join(_os.path.dirname(__file__), '..', 'outputs')
         )
-        cfg['paths']['temp']       = _os.path.join(local_out, 'models')
-        cfg['paths']['model_save'] = _os.path.join(local_out, 'models', 'best_model.pt')
-        cfg['paths']['output']     = _os.path.join(local_out, 'submissions', 'preds.npy')
+        cfg['paths']['temp']            = _os.path.join(local_out, 'models')
+        cfg['paths']['model_save']      = _os.path.join(local_out, 'models', 'best_model.pt')
+        cfg['paths']['output']          = _os.path.join(local_out, 'submissions', 'preds.npy')
+        # Pixel stats stored alongside model checkpoint
+        cfg['paths']['pixel_stats']     = _os.path.join(local_out, 'models', 'pixel_stats.npz')
         _os.makedirs(cfg['paths']['temp'], exist_ok=True)
         _os.makedirs(_os.path.join(local_out, 'submissions'), exist_ok=True)
     else:
         cfg['paths']['data'] = _resolve_kaggle_data_path(cfg)
         _os.makedirs(cfg['paths']['temp'], exist_ok=True)
+        # pixel_stats loaded from config or default /kaggle/temp path
+        cfg['paths']['pixel_stats'] = cfg.get('data', {}).get(
+            'pixel_stats_path', '/kaggle/temp/pixel_stats.npz'
+        )
 
     # Build min_max path from data root
     cfg['paths']['min_max'] = _os.path.join(cfg['paths']['data'], 'stats', 'feat_min_max.mat')
