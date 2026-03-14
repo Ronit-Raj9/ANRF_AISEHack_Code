@@ -709,9 +709,11 @@ def build_test_input(cfg, bounds: dict, start: int = 0, end: int | None = None) 
     bs = end - start
 
     base = {}
-    dec_mu = dec_sigma = None
-    if cfg.get('data', {}).get('december_grid_sigma_norm', True):
-        dec_mu, dec_sigma = _get_december_grid_stats(cfg)
+    # NOTE: december_grid_sigma_norm is intentionally NOT applied here.
+    # Training used SlidingWindowTensorDataset which stores cpm25 with plain
+    # min-max log1p normalization for ALL months (including December).
+    # Applying December grid-wise sigma at test time would create a train/test
+    # mismatch and produce garbage predictions.
 
     for feat in features:
         if feat == 'rain_mask':
@@ -723,12 +725,15 @@ def build_test_input(cfg, bounds: dict, start: int = 0, end: int | None = None) 
         path = os.path.join(data_dir, 'test_in', f'{feat}.npy')
         arr = np.load(path, mmap_mode='r')[start:end]
         if feat == 'cpm25':
+            # Standard min-max log1p normalization — matches SlidingWindowTensorDataset
             cpm_proc = preprocess_feature(arr, feat, bounds, month=None)
-            if dec_mu is not None and dec_sigma is not None:
-                cpm_log = _transform_feature_values(arr, 'cpm25')
-                cpm_proc = ((cpm_log - dec_mu[None, :, :]) / dec_sigma[None, :, :]).astype(np.float32)
-            pad = np.zeros((bs, t_in_met - t_in_cpm, 140, 124), dtype=np.float32)
-            base[feat] = np.concatenate([cpm_proc, pad], axis=1)
+            # Fill unknown future cpm25 hours with persistence (repeat last known frame).
+            # Training saw actual future cpm25 values; persistence is the closest
+            # in-distribution approximation at test time.
+            n_fill = t_in_met - t_in_cpm  # = 16
+            last_known = cpm_proc[:, -1:, :, :]  # (bs, 1, H, W)
+            fill = np.repeat(last_known, n_fill, axis=1)  # (bs, 16, H, W)
+            base[feat] = np.concatenate([cpm_proc, fill], axis=1)  # (bs, 26, H, W)
             continue
         base[feat] = preprocess_feature(arr, feat, bounds, month=None)
 
