@@ -1,0 +1,419 @@
+# Experiment 01 — Baseline TFNO2D: Complete Configuration & Methods Reference
+
+> **Scope**: This document covers **only** the baseline TFNO2D run (`exp_01_baseline.ipynb`), excluding UNet and ResidualSTUNet architectures.
+
+---
+
+## 1. Features & Input Channels
+
+| Group | Features | Count |
+|-------|----------|-------|
+| **Target** | [cpm25](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/data.py#103-105) | 1 |
+| **Meteorological** | `u10`, `v10`, `pblh`, [rain](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/train.py#214-368), `t2`, `q2` | 6 |
+| **Emissions** | [PM25](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/data.py#288-348) | 1 |
+| **Total base** | — | **8** |
+| **Auxiliary (disabled)** | `lat`, `lon`, `hour_sin`, `hour_cos`, `doy_sin`, `doy_cos` | 0 (baseline has `use_aux: false`) |
+| **Input channels** | — | **8** |
+
+The feature list is constructed as: `["cpm25"] + met + emis`
+
+> [!NOTE]
+> The 8 official PM25 features represent 8 meteorological + emission variables. Despite 16 being mentioned in the notebook comments, the actual [config.yaml](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/configs/config.yaml) `features` section yields 8 base features. The "16" in notebook comments refers to the **16 forecast output time steps**, not input features.
+
+---
+
+## 2. Temporal Configuration
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `t_in_cpm` | **10** | Hours of known cpm25 history available at test time |
+| `t_in_met` | **26** | Met/emis input window (10 past + 16 NWP forecast hours) |
+| `t_out` | **16** | Forecast horizon (predict next 16 hours) |
+| `stride_train` | **2** | Sliding window stride for training samples |
+| `stride_val` | **4** | Sliding window stride for validation samples |
+
+### Window Construction
+
+```
+Time axis:  ──────────────────────────────────────────────────
+             |← 10 hrs past →|← 16 hrs future NWP forecast →|
+Met/Emis:    [0 ─────────── 26)   all channels available
+cpm25:       [0 ── 10) known     [10 ── 26) masked with 0.0
+Target:                          [10 ── 26) = 16 future cpm25 hours
+```
+
+---
+
+## 3. Data Splits (Temporal Blocking)
+
+| Split | Months | Strategy |
+|-------|--------|----------|
+| **Train** | `APRIL_16`, `JULY_16`, `DEC_16` | All months except val_month |
+| **Validation** | `OCT_16` | Held out entirely (strict temporal blocking) |
+| **Test** | 996 samples | From [test_in/](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/data.py#409-469) directory (competition data) |
+
+> [!IMPORTANT]
+> No window straddles the train/val boundary because months are loaded from separate `.npy` files.
+
+---
+
+## 4. Preprocessing & Normalization
+
+### 4.1 Min-Max Normalization
+
+**Source**: Official `feat_min_max.mat` file (or hardcoded fallback bounds locally).
+
+**Method**: [normalize(arr, fmin, fmax)](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/data.py#89-96) → clips to `[0, 1]`
+```python
+normed = (arr - fmin) / (fmax - fmin)
+normed = clip(normed, 0.0, 1.0)
+```
+
+**Per-feature bounds** (from `FALLBACK_OFFICIAL_BOUNDS`):
+
+| Feature | Min | Max | Range |
+|---------|-----|-----|-------|
+| [cpm25](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/data.py#103-105) | 0.9940 | 1465.25 | 1464.256 |
+| `u10` | −26.829 | 29.026 | 55.855 |
+| `v10` | −29.216 | 31.930 | 61.146 |
+| `pblh` | 52.115 | 6271.4 | 6219.285 |
+| [rain](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/train.py#214-368) | 0.0 | 96.627 | 96.627 |
+| `t2` | 223.53 | 324.77 | 101.24 |
+| `q2` | 0.0 | 0.045855 | 0.045855 |
+| `swdown` | 0.0 | 1320.3 | 1320.3 |
+| `psfc` | 47353.0 | 102290.0 | 54937.0 |
+| [PM25](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/data.py#288-348) | 0.0 | 1.4269e−07 | 1.4269e−07 |
+| `SO2` | 0.0 | 5.4354e−08 | 5.4354e−08 |
+| `NOx` | 0.0 | 7.9771e−08 | 7.9771e−08 |
+| `NH3` | 0.0 | 2.0868e−08 | 2.0868e−08 |
+| `NMVOC_e` | 0.0 | 1.0691e−08 | 1.0691e−08 |
+| `NMVOC_finn` | 0.0 | 7.0491e−06 | 7.0491e−06 |
+| `bio` | 0.0 | 8.2258e−09 | 8.2258e−09 |
+
+### 4.2 cpm25-Specific Transforms (config flags)
+
+| Config Key | Value | Effect |
+|------------|-------|--------|
+| [cpm25_log1p](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/data.py#103-105) | `true` | Apply [log1p](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/data.py#103-105) before min-max normalization for cpm25 |
+| [cpm25_grid_zscore](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/data.py#107-109) | `true` | Per-grid-cell z-score on top of normalized cpm25 |
+| `cpm25_grid_eps` | `1e-6` | Epsilon for grid std clamp |
+
+**cpm25 normalization pipeline**:
+1. `x = max(arr, 0.0)` — clamp negatives
+2. `x = log1p(x)` — log transform (if `cpm25_log1p: true`)
+3. `fmin, fmax = log1p(bounds['cpm25'])` — transform bounds too
+4. `x = (x - fmin) / (fmax - fmin)` → clip `[0, 1]`
+5. Per-grid z-score: `x = (x - grid_mean) / grid_std` (computed from train months only)
+
+### 4.3 Denormalization (Inverse)
+
+For predictions, the inverse is applied:
+1. Undo grid z-score: `x = x * grid_std + grid_mean`
+2. Undo min-max: `x = x * (fmax - fmin) + fmin`
+3. Undo log1p: `x = expm1(x)`
+4. Clamp: `x = max(x, 0.0)`
+
+---
+
+## 5. Dataset & DataLoader
+
+### PM25Dataset (Lazy Sliding Window)
+
+| Property | Value |
+|----------|-------|
+| **Class** | [PM25Dataset(Dataset)](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/data.py#288-348) |
+| **Window size** | `t_cpm + t_out = 10 + 16 = 26` time steps consumed |
+| **Input tensor shape** | [(C=8, T_in=26, H=140, W=124)](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/model.py#84-93) float32 |
+| **Target tensor shape** | [(H=140, W=124, T_out=16)](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/model.py#84-93) float32 |
+| **cpm25 masking** | Input cpm25 hours `[10:26)` set to `0.0` (unknown at test time) |
+| **Memory strategy** | Month arrays pre-normalized in RAM; windows sliced on-the-fly |
+
+### DataLoader Configuration
+
+| Parameter | Train | Validation | Test |
+|-----------|-------|------------|------|
+| `batch_size` | **4** | **8** | **16** |
+| `shuffle` | `True` (if no weighted sampler) | `False` | N/A |
+| `num_workers` | **2** | **2** | N/A |
+| `pin_memory` | `true` | `true` | N/A |
+| `drop_last` | `True` | `False` | N/A |
+
+### Weighted Random Sampler
+
+| Parameter | Value |
+|-----------|-------|
+| `use_weighted_sampler` | `true` |
+| `default_sampling_weight` | `1.0` |
+| **Month weights** | `APRIL_16: 0.5`, `JULY_16: 0.5`, `DEC_16: 3.0` |
+| `replacement` | `True` |
+
+> [!TIP]
+> `DEC_16` is weighted 6× higher than `APRIL_16` / `JULY_16`, likely because winter PM2.5 patterns are closer to the test distribution.
+
+---
+
+## 6. Model Architecture — TFNO2D
+
+### Architecture Summary
+
+**Tucker-Factorized Fourier Neural Operator (2D)** — learns global spectral patterns via FFT.
+
+```mermaid
+graph LR
+    A["Input<br/>(B, C*T, H, W)"] --> B["Lift<br/>Conv2d 1×1"]
+    B --> C["FNO Block ×6"]
+    C --> D["Projection<br/>Conv2d 1×1 → GELU → Conv2d 1×1"]
+    D --> E["Output<br/>(B, H, W, T_out)"]
+```
+
+### TFNO2D Hyperparameters
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `width` | **64** | Hidden channel dimension |
+| [modes](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/inference.py#20-28) | **20** | Number of Fourier modes retained per dimension |
+| `depth` | **6** | Number of FNO blocks |
+| `in_channels` | **8 × 26 = 208** | channels × time steps (time flattened into channels) |
+| `out_steps` | **16** | Output time steps |
+
+### Forward Pass
+
+1. **Reshape**: [(B, C=8, T=26, H=140, W=124)](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/model.py#84-93) → [(B, 208, 140, 124)](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/model.py#84-93) (flatten time into channels)
+2. **Lift**: [Conv2d(208, 64, kernel_size=1)](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/model.py#421-454) → [(B, 64, 140, 124)](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/model.py#84-93)
+3. **6× FNO Blocks** each containing:
+   - [_SpectralConv2d](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/model.py#421-454): FFT → multiply with learnable complex weights in spectral domain → IFFT
+   - [Conv2d(64, 64, 1)](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/model.py#421-454): bypass/skip connection
+   - `GroupNorm(8, 64)` + `GELU` activation
+4. **Projection**: [Conv2d(64, 128, 1)](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/model.py#421-454) → `GELU` → [Conv2d(128, 16, 1)](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/model.py#421-454)
+5. **Permute**: [(B, 16, H, W)](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/model.py#84-93) → [(B, H, W, 16)](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/model.py#84-93)
+
+### SpectralConv2d Details
+
+- Uses `torch.fft.rfft2` with `norm='ortho'`
+- Retains `modes × modes` (20 × 20) low-frequency coefficients
+- Two learned weight matrices: `weight_pos` and `weight_neg` for positive and negative frequency halves
+- Scale initialization: `1 / (in_ch * out_ch)`
+- Einsum contraction: `'bixy,ioxy->boxy'`
+
+---
+
+## 7. Loss Function
+
+### Primary Loss: [objective_loss](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/train.py#130-157)
+
+The loss type is determined by `loss.type` in config:
+
+| Config | Value |
+|--------|-------|
+| `loss.type` | [log_rmse](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/train.py#118-128) |
+
+### Loss Computation Pipeline
+
+#### Phase 1 (epochs 0–19): Blended log-RMSE + weighted MAE
+
+```
+loss = 0.8 × log_rmse + 0.2 × weighted_mae_phys
+```
+
+#### Phase 2 (epochs ≥ 20): Pure weighted physical MAE
+
+```
+loss = weighted_mae_phys(pred, target)
+```
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `phase_switch_epoch` | **20** | Epoch to switch from blended to pure weighted MAE |
+| `phase2_mode` | [weighted_mae_phys](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/train.py#73-85) | Loss used after phase switch |
+| `intensity_weighted` | `true` | Enable per-pixel intensity weighting |
+
+### log-RMSE Loss
+
+1. Convert normalized predictions/targets to log1p-physical domain
+2. Compute spatial MSE per batch per horizon: `mean((pred - target)², dim=(H, W))`
+3. Apply horizon weights → `sqrt(weighted_MSE + 1e-8)` → average over batch & time
+
+### Weighted MAE (Physical Domain)
+
+1. Convert to physical µg/m³ via inverse normalization
+2. Per-pixel intensity weight: `w = 1.0 + α × clamp(target / ref, 0, cap)`
+   - `intensity_alpha`: **1.5**
+   - `intensity_ref`: **59.0** µg/m³ (reference concentration)
+   - `intensity_cap`: **3.0** (max weight multiplier)
+3. Weighted MAE × horizon weights → average
+
+### Horizon Weights (Applied to All Loss Types)
+
+Linearly increasing weights across the 16 forecast horizons:
+
+| Parameter | Value |
+|-----------|-------|
+| `horizon_weight_min` | **0.8** (weight for h+1) |
+| `horizon_weight_max` | **1.4** (weight for h+16) |
+
+```python
+weights = torch.linspace(0.8, 1.4, 16)  # emphasizes longer lead times
+```
+
+### Metric Loss (for Validation & Checkpointing)
+
+Separate from the training objective — uses standard **weighted RMSE** in normalized space for validation metrics and persistence gate comparison.
+
+---
+
+## 8. Optimizer & Scheduler
+
+| Component | Type | Parameters |
+|-----------|------|------------|
+| **Optimizer** | `AdamW` | `lr=1e-3`, `weight_decay=1e-4` |
+| **Scheduler** | `OneCycleLR` | `max_lr=1e-3`, `pct_start=0.1` (10% warmup), per-step stepping |
+| **Gradient clipping** | `clip_grad_norm_` | `max_norm=1.0` |
+| **AMP** | `torch.cuda.amp.GradScaler` | `use_amp=true` (float16 on CUDA) |
+
+---
+
+## 9. Training Loop
+
+| Parameter | Value |
+|-----------|-------|
+| `epochs` | **60** |
+| `patience` | **8** (early stopping) |
+| [seed](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/utils.py#11-20) | **42** |
+
+### Per-Epoch Flow
+
+1. **Train**: Forward → [objective_loss](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/train.py#130-157) → backward with AMP scaling → `unscale_` → `clip_grad_norm_(1.0)` → step → scheduler step
+2. **Validate**: Forward → compute [rmse_loss](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/train.py#31-44) (metric), [objective_loss](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/train.py#130-157), and [persistence_rmse_from_batch](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/train.py#203-208)
+3. **Checkpoint selection metric**:
+   - Mode: `mixed`
+   - Formula: `0.7 × val_objective + 0.3 × val_rmse`
+4. **Persistence gate check**: Every 5 epochs, compare val RMSE to `0.0208` (normalized) / `30.83` µg/m³
+
+### Persistence Baseline Gate
+
+| Metric | Value |
+|--------|-------|
+| Normalized RMSE (t+16 avg) | **0.0208** |
+| Physical RMSE | **30.83 µg/m³** |
+
+The model must beat this persistence baseline (predicting last observed value forward) to be considered useful.
+
+### Early Stopping
+
+- Tracks `selection_metric = 0.7 × val_objective + 0.3 × val_rmse`
+- Saves best checkpoint to `best_model.pt`
+- Stops if no improvement for **8 consecutive epochs**
+
+---
+
+## 10. Inference
+
+| Parameter | Value |
+|-----------|-------|
+| `batch_size_test` | **16** |
+| `test_samples` | **996** |
+| `use_tta` | `true` |
+| [tta_modes](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/inference.py#20-28) | `identity`, `hflip`, `vflip`, `hvflip` |
+
+### Inference Pipeline
+
+1. Load best checkpoint (`best_model.pt`)
+2. Build test input: normalize all features, pad cpm25 `[10:26)` with zeros, shape [(996, 8, 26, 140, 124)](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/model.py#84-93)
+3. **Test-Time Augmentation (TTA)**: For each batch, run 4 augmented passes (identity + 3 flips), average predictions
+4. **Denormalize** predictions back to physical µg/m³
+5. Save `preds.npy` of shape [(996, 140, 124, 16)](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/model.py#84-93)
+6. Assertions: shape = [(996, 140, 124, 16)](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/model.py#84-93), all values finite
+
+### Output
+
+| File | Shape | Units |
+|------|-------|-------|
+| `preds.npy` | [(996, 140, 124, 16)](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/model.py#84-93) | Physical PM2.5 µg/m³ |
+
+---
+
+## 11. Reproducibility & Seeding
+
+```python
+random.seed(42)
+np.random.seed(42)
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+os.environ['PYTHONHASHSEED'] = '42'
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+```
+
+---
+
+## 12. Proxy Scoring (Local Evaluation)
+
+Since official test ground truth is hidden, the notebook computes proxy scores:
+
+| Metric | Value (from notebook run) |
+|--------|---------------------------|
+| RMSE(H+1 vs last observed) | **13.5603** |
+| MAE(H+1 vs last observed) | **8.3809** |
+| RMSE(all horizons vs persistence) | **27.3255** |
+| MAE(all horizons vs persistence) | **13.9827** |
+| Mean abs step change (H→H+1) | **2.3469** |
+
+---
+
+## 13. Summary Table — All Key Config Values
+
+| Category | Parameter | Value |
+|----------|-----------|-------|
+| **Features** | Base features | 8 ([cpm25](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/data.py#103-105) + 6 met + 1 emis) |
+| | Auxiliary | Disabled (`use_aux: false`) |
+| **Time** | Input window | 26 hrs (10 cpm25 + 16 NWP) |
+| | Output horizon | 16 hrs |
+| | Train stride | 2 |
+| | Val stride | 4 |
+| **Data** | Train months | `APRIL_16`, `JULY_16`, `DEC_16` |
+| | Val month | `OCT_16` |
+| | Test samples | 996 |
+| | Grid size | 140 × 124 |
+| **Preprocessing** | Normalization | Min-max `[0,1]` from `feat_min_max.mat` |
+| | cpm25 log1p | `true` |
+| | cpm25 grid z-score | `true` |
+| **Model** | Type | `tfno2d` |
+| | Width | 64 |
+| | Modes | 20 |
+| | Depth | 6 |
+| | Total input dim | 208 (8 × 26) |
+| **Training** | Optimizer | AdamW |
+| | Learning rate | 1e−3 |
+| | Weight decay | 1e−4 |
+| | Scheduler | OneCycleLR (10% warmup) |
+| | Epochs | 60 |
+| | Patience | 8 |
+| | Batch size (train) | 4 |
+| | Batch size (val) | 8 |
+| | Grad clip | 1.0 |
+| | AMP | float16 |
+| | Seed | 42 |
+| **Loss** | Type | [log_rmse](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/train.py#118-128) (phase 1) → [weighted_mae_phys](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/train.py#73-85) (phase 2) |
+| | Phase switch | Epoch 20 |
+| | Horizon weights | 0.8 → 1.4 (linear) |
+| | Intensity weighting | α=1.5, ref=59.0, cap=3.0 |
+| **Checkpoint** | Metric | `0.7 × val_objective + 0.3 × val_rmse` |
+| **Sampler** | Weighted | Yes (DEC=3.0, APR=0.5, JUL=0.5) |
+| **Inference** | TTA | 4-fold (identity + flips) |
+| | Batch size | 16 |
+| **Persistence gate** | RMSE (norm) | 0.0208 |
+| | RMSE (phys) | 30.83 µg/m³ |
+
+---
+
+## Source Files Reference
+
+| File | Purpose |
+|------|---------|
+| [config.yaml](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/configs/config.yaml) | All hyperparameters and paths |
+| [config.py](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/config.py) | Config loading, path resolution, derived fields |
+| [data.py](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/data.py) | Normalization, dataset, dataloaders |
+| [model.py](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/model.py) | TFNO2D architecture |
+| [train.py](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/train.py) | Loss functions, optimizer, training loop |
+| [inference.py](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/inference.py) | TTA inference, denormalization, save |
+| [utils.py](file:///home/raj/Documents/CODING/Hackathon/ANRF_TEST/ANRF_AISEHack_Code/Ronit/src/utils.py) | Seeding, device info, param counting |

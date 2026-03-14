@@ -66,6 +66,9 @@ def load_config(config_path: str = None) -> dict:
     cfg['preprocessing'].setdefault('grid_stats_filename', 'grid_log_scaler_2016.npz')
     cfg['preprocessing'].setdefault('grid_stats_eps', 1.0e-6)
     cfg['preprocessing'].setdefault('auto_build_grid_stats', True)
+    cfg['preprocessing'].setdefault('grid_stats_train_only', True)
+    cfg['preprocessing'].setdefault('enforce_grid_stats_train_months', True)
+    cfg['preprocessing'].setdefault('temporal_gap_hours', 12)
     cfg['preprocessing'].setdefault('signed_log_for_negative', True)
     cfg['preprocessing'].setdefault('log_eps', 1.0e-12)
     cfg['preprocessing'].setdefault('log1p_features', ['cpm25', 'rain', 'ventilation_index'])
@@ -136,9 +139,16 @@ def load_config(config_path: str = None) -> dict:
 
     # Build min_max path from data root
     cfg['paths']['min_max'] = _os.path.join(cfg['paths']['data'], 'stats', 'feat_min_max.mat')
-    cfg['paths']['grid_stats'] = _os.path.join(
-        cfg['paths']['data'], 'stats', cfg['preprocessing']['grid_stats_filename']
-    )
+    grid_stats_name = cfg['preprocessing']['grid_stats_filename']
+    input_grid_stats = _os.path.join(cfg['paths']['data'], 'stats', grid_stats_name)
+
+    # On Kaggle, /kaggle/input is read-only. Load from input when present;
+    # otherwise save newly built scaler into /kaggle/working.
+    if _os.path.exists('/kaggle'):
+        working_grid_stats = _os.path.join('/kaggle/working', grid_stats_name)
+        cfg['paths']['grid_stats'] = input_grid_stats if _os.path.exists(input_grid_stats) else working_grid_stats
+    else:
+        cfg['paths']['grid_stats'] = input_grid_stats
 
     # Model registry settings: allow either top-level model params or nested models.{type}
     model_type = cfg['model'].get('type', 'tfno2d').lower()

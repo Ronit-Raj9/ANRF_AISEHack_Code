@@ -1,5 +1,3 @@
-"""Three-phase training loop for the physics-informed FrNO pipeline."""
-
 import os
 import numpy as np
 import torch
@@ -12,195 +10,78 @@ except ImportError:
     _wandb = None
     _WANDB_AVAILABLE = False
 
-PERSISTENCE_RMSE_PHYS = 30.83
-
+PERSISTENCE_RMSE_PHYS = 30.83  # µg/m³
 
 def _checkpoint_enabled(cfg: dict) -> bool:
     return bool(cfg.get('training', {}).get('enable_checkpointing', True))
 
-
-def _checkpoint_every(cfg: dict) -> int:
-    return int(cfg.get('training', {}).get('checkpoint_every_epochs', 5))
-
-
 def _checkpoint_dir(cfg: dict) -> str:
-    cdir = cfg.get('paths', {}).get('checkpoint_dir')
-    if cdir:
-        return cdir
-    return os.path.join(cfg['paths']['temp'], 'checkpoints')
-
+    return cfg.get('paths', {}).get('checkpoint_dir', os.path.join(cfg['paths']['temp'], 'checkpoints'))
 
 def _checkpoint_last_path(cfg: dict) -> str:
-    last = cfg.get('paths', {}).get('checkpoint_last')
-    if last:
-        return last
-    return os.path.join(_checkpoint_dir(cfg), 'last_checkpoint.pt')
+    return cfg.get('paths', {}).get('checkpoint_last', os.path.join(_checkpoint_dir(cfg), 'last_checkpoint.pt'))
 
-
-def _checkpoint_epoch_path(cfg: dict, epoch_1based: int) -> str:
-    return os.path.join(_checkpoint_dir(cfg), f'checkpoint_epoch_{epoch_1based:04d}.pt')
-
-
-def _save_training_checkpoint(
-    cfg: dict,
-    epoch_1based: int,
-    model,
-    optimizer,
-    scheduler,
-    scaler,
-    history: dict,
-    best_metric: float,
-    patience_count: int,
-) -> None:
-    if not _checkpoint_enabled(cfg):
-        return
+def _save_training_checkpoint(cfg, epoch_1based, model, optimizer, scheduler, scaler, history, best_metric, patience_count, is_best=False):
+    if not _checkpoint_enabled(cfg): return
     os.makedirs(_checkpoint_dir(cfg), exist_ok=True)
     payload = {
-        'epoch': epoch_1based,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
-        'history': history,
-        'best_metric': float(best_metric),
-        'patience_count': int(patience_count),
+        'epoch': epoch_1based, 'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
+        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+        'scaler_state_dict': scaler.state_dict() if scaler else None,
+        'history': history, 'best_metric': float(best_metric), 'patience_count': int(patience_count),
     }
-    epoch_path = _checkpoint_epoch_path(cfg, epoch_1based)
-    last_path = _checkpoint_last_path(cfg)
-    torch.save(payload, epoch_path)
-    torch.save(payload, last_path)
-    print(f"Checkpoint saved: {epoch_path}")
-
+    # Always save/overwrite the last checkpoint
+    torch.save(payload, _checkpoint_last_path(cfg))
+    # When a new best metric is achieved, also save/overwrite the best checkpoint
+    if is_best:
+        torch.save(payload, cfg['paths']['model_save'])
 
 def _resolve_resume_checkpoint(cfg: dict) -> str | None:
     explicit = cfg.get('training', {}).get('resume_checkpoint_path')
-    if isinstance(explicit, str) and explicit and os.path.exists(explicit):
-        return explicit
+    if explicit and os.path.exists(explicit): return explicit
     last_path = _checkpoint_last_path(cfg)
-    if os.path.exists(last_path):
-        return last_path
-    cdir = _checkpoint_dir(cfg)
-    if not os.path.isdir(cdir):
-        return None
-    candidates = [
-        os.path.join(cdir, name)
-        for name in os.listdir(cdir)
-        if name.startswith('checkpoint_epoch_') and name.endswith('.pt')
-    ]
-    if not candidates:
-        return None
-    candidates.sort()
-    return candidates[-1]
+    if os.path.exists(last_path): return last_path
+    return None
 
-
-def _try_resume_training_state(cfg: dict, model, optimizer, scheduler, scaler):
+def _try_resume_training_state(cfg, model, optimizer, scheduler, scaler):
     if not bool(cfg.get('training', {}).get('resume_if_available', True)):
         return 0, float('inf'), 0, None
     path = _resolve_resume_checkpoint(cfg)
-    if not path:
-        return 0, float('inf'), 0, None
-
+    if not path: return 0, float('inf'), 0, None
     payload = torch.load(path, map_location=cfg['device'])
     model.load_state_dict(payload['model_state_dict'])
-    if 'optimizer_state_dict' in payload:
-        optimizer.load_state_dict(payload['optimizer_state_dict'])
-    if 'scheduler_state_dict' in payload:
-        scheduler.load_state_dict(payload['scheduler_state_dict'])
-    if scaler is not None and payload.get('scaler_state_dict') is not None:
-        scaler.load_state_dict(payload['scaler_state_dict'])
-
-    start_epoch = int(payload.get('epoch', 0))
-    best_metric = float(payload.get('best_metric', float('inf')))
-    patience_count = int(payload.get('patience_count', 0))
-    history = payload.get('history')
-    print(f"Resumed from checkpoint: {path} (next epoch: {start_epoch + 1})")
-    return start_epoch, best_metric, patience_count, history
-
+    if optimizer and 'optimizer_state_dict' in payload: optimizer.load_state_dict(payload['optimizer_state_dict'])
+    if scheduler and 'scheduler_state_dict' in payload: scheduler.load_state_dict(payload['scheduler_state_dict'])
+    if scaler and payload.get('scaler_state_dict'): scaler.load_state_dict(payload['scaler_state_dict'])
+    print(f"Resumed from {path}")
+    return int(payload.get('epoch', 0)), float(payload.get('best_metric', float('inf'))), int(payload.get('patience_count', 0)), payload.get('history')
 
 def init_wandb(cfg: dict):
-    if not _WANDB_AVAILABLE:
-        print('wandb not installed — skipping W&B logging.')
-        return None
-    wcfg = cfg.get('wandb', {})
-    if not bool(wcfg.get('enabled', False)):
-        return None
-
+    if not _WANDB_AVAILABLE or not bool(cfg.get('wandb', {}).get('enabled', False)): return None
     run = _wandb.init(
-        entity=wcfg.get('entity', None),
-        project=wcfg.get('project', 'aisehack'),
-        name=wcfg.get('run_name') or None,
-        tags=wcfg.get('tags', []),
-        config={
-            'model_type': cfg['model']['type'],
-            'val_month': cfg['data']['val_month'],
-            'epochs': cfg['training']['epochs'],
-            'phase1_epochs': cfg['training'].get('phase1_epochs', 20),
-            'phase2_epochs': cfg['training'].get('phase2_epochs', 20),
-            'phase3_epochs': cfg['training'].get('phase3_epochs', 10),
-            'batch_size_train': cfg['training']['batch_size_train'],
-            'lr': cfg['training']['lr'],
-            'weight_decay': cfg['training']['weight_decay'],
-            'rank_ratio': cfg['model'].get('rank_ratio', 0.4),
-            'alpha_init': cfg['model'].get('alpha_init', 0.35),
-            'persistence_rmse_phys': PERSISTENCE_RMSE_PHYS,
-        },
-        reinit=True,
+        entity=cfg['wandb'].get('entity', None), project=cfg['wandb'].get('project', 'aisehack'),
+        name=cfg['wandb'].get('run_name'), tags=cfg['wandb'].get('tags', []), reinit='finish_previous'
     )
-
-    _wandb.define_metric('epoch')
-    for metric in [
-        'train/objective', 'train/rmse_std', 'train/physics',
-        'val/objective', 'val/rmse_std', 'val/rmse_phys',
-        'val/persistence_phys', 'val/persistence_ratio',
-        'lr', 'grad_norm', 'best/selection_metric', 'best/val_rmse_phys',
-    ]:
-        _wandb.define_metric(metric, step_metric='epoch')
     return run
 
-
-def finish_wandb(run, history: dict, bounds: dict | None, cfg: dict):
-    if run is None or not _WANDB_AVAILABLE:
-        return
-    epochs_ran = len(history.get('val_phys_rmse', []))
-    if epochs_ran == 0:
-        run.finish()
-        return
-
-    best_idx = int(np.argmin(np.asarray(history['selection_metric'])))
-    run.summary['best_epoch'] = best_idx + 1
-    run.summary['best_phase'] = history['phase'][best_idx]
-    run.summary['best_val_rmse_phys'] = history['val_phys_rmse'][best_idx]
-    run.summary['best_val_rmse_std'] = history['val_loss'][best_idx]
-    run.summary['beats_global_persistence'] = int(history['val_phys_rmse'][best_idx] < PERSISTENCE_RMSE_PHYS)
-    run.summary['global_persistence_ratio'] = history['val_phys_rmse'][best_idx] / PERSISTENCE_RMSE_PHYS
+def finish_wandb(run, history: dict, bounds: dict, cfg: dict):
+    if run is None or not _WANDB_AVAILABLE: return
+    if history.get('val_phys_rmse'):
+        best_idx = int(np.argmin(history.get('selection_metric', history['val_phys_rmse'])))
+        run.summary['best_val_rmse_phys'] = history['val_phys_rmse'][best_idx]
+        run.summary['best_val_rmse_std'] = history['val_loss'][best_idx]
     run.finish()
 
-
-def rmse_per_horizon(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    spatial_mse = torch.mean((pred - target) ** 2, dim=(1, 2))
-    return torch.sqrt(spatial_mse.mean(0) + 1e-8)
-
-
-def rmse_loss(pred: torch.Tensor, target: torch.Tensor, cfg: dict | None = None) -> torch.Tensor:
-    spatial_mse = torch.mean((pred - target) ** 2, dim=(1, 2))
-    return torch.mean(torch.sqrt(spatial_mse + 1e-8))
-
-
-def mse_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    return torch.mean((pred - target) ** 2)
-
+def rmse_loss(pred, target):
+    return torch.mean(torch.sqrt(torch.mean((pred - target) ** 2, dim=(1, 2)) + 1e-8))
 
 def _grid_stats_tensors(cfg: dict, device, dtype):
     stats = cfg.get('_runtime', {}).get('grid_stats')
-    if stats is None or 'cpm25' not in stats:
-        raise RuntimeError('Grid scaler statistics for cpm25 are missing.')
     mean, std = stats['cpm25']
-    mean_t = torch.as_tensor(mean, device=device, dtype=dtype)[None, :, :, None]
-    std_t = torch.as_tensor(std, device=device, dtype=dtype)[None, :, :, None]
-    return mean_t, std_t
+    return torch.as_tensor(mean, device=device, dtype=dtype)[None, :, :, None], torch.as_tensor(std, device=device, dtype=dtype)[None, :, :, None]
 
-
-def _normalized_to_log1p_domain(x: torch.Tensor, cfg: dict, bounds: dict) -> torch.Tensor:
+def _normalized_to_log1p_domain(x, cfg, bounds):
     if str(cfg.get('preprocessing', {}).get('normalization', '')).lower() == 'grid_log_standardize':
         mean_t, std_t = _grid_stats_tensors(cfg, x.device, x.dtype)
         return x * std_t + mean_t
@@ -211,394 +92,202 @@ def _normalized_to_log1p_domain(x: torch.Tensor, cfg: dict, bounds: dict) -> tor
         return x * (hi - lo) + lo
     return x * (fmax - fmin) + fmin
 
-
-def _normalized_to_physical_domain(x: torch.Tensor, cfg: dict, bounds: dict) -> torch.Tensor:
+def _normalized_to_physical_domain(x, cfg, bounds):
     log_domain = _normalized_to_log1p_domain(x, cfg, bounds)
-    return torch.clamp(torch.expm1(log_domain), min=0.0)
+    norm = str(cfg.get('preprocessing', {}).get('normalization', '')).lower()
+    if 'grid_log' in norm:
+        log_domain = torch.clamp(log_domain, min=-20.0, max=20.0)
+        return torch.clamp(torch.expm1(log_domain), min=0.0)
 
+    is_log1p = bool(cfg.get('preprocessing', {}).get('cpm25_log1p', False))
+    if is_log1p:
+        log_domain = torch.clamp(log_domain, min=-20.0, max=20.0)
+        return torch.clamp(torch.expm1(log_domain), min=0.0)
+    return torch.clamp(log_domain, min=0.0)
 
-def physical_rmse_metric(pred: torch.Tensor, target: torch.Tensor, cfg: dict, bounds: dict | None) -> torch.Tensor:
-    if bounds is None or 'cpm25' not in bounds:
-        return rmse_loss(pred, target)
+def physical_rmse_metric(pred, target, cfg, bounds):
+    if bounds is None or 'cpm25' not in bounds: return rmse_loss(pred, target)
     pred_phys = _normalized_to_physical_domain(pred, cfg, bounds)
     target_phys = _normalized_to_physical_domain(target, cfg, bounds)
-    mse = torch.mean((pred_phys - target_phys) ** 2, dim=(1, 2))
-    return torch.mean(torch.sqrt(mse + 1e-8))
+    return torch.mean(torch.sqrt(torch.mean((pred_phys - target_phys) ** 2, dim=(1, 2)) + 1e-8))
 
-
-def _intensity_weights(target_phys: torch.Tensor, cfg: dict) -> torch.Tensor:
-    ref = float(cfg.get('loss', {}).get('intensity_ref', 59.1))
-    return 1.0 + torch.clamp(target_phys / max(ref, 1e-6), min=0.0)
-
-
-def weighted_mae_phys_loss(pred: torch.Tensor, target: torch.Tensor, cfg: dict, bounds: dict | None) -> torch.Tensor:
-    if bounds is None or 'cpm25' not in bounds:
-        return torch.mean(torch.abs(pred - target))
-    pred_phys = _normalized_to_physical_domain(pred, cfg, bounds)
-    target_phys = _normalized_to_physical_domain(target, cfg, bounds)
-    weights = _intensity_weights(target_phys, cfg)
-    return torch.mean(torch.abs(pred_phys - target_phys) * weights)
-
-
-def smooth_tail_loss(pred: torch.Tensor, target: torch.Tensor, cfg: dict, bounds: dict | None) -> torch.Tensor:
-    mode = str(cfg.get('loss', {}).get('phase3_smooth', 'huber')).lower()
-    if bounds is None or 'cpm25' not in bounds:
-        err = pred - target
-    else:
-        pred_phys = _normalized_to_physical_domain(pred, cfg, bounds)
-        target_phys = _normalized_to_physical_domain(target, cfg, bounds)
-        err = pred_phys - target_phys
-
-    if mode == 'logcosh':
-        return torch.mean(torch.log(torch.cosh(err + 1e-12)))
-
-    delta = float(cfg.get('loss', {}).get('huber_delta', 25.0))
-    abs_err = torch.abs(err)
-    quad = torch.minimum(abs_err, torch.tensor(delta, device=err.device, dtype=err.dtype))
-    lin = abs_err - quad
-    return torch.mean(0.5 * quad * quad + delta * lin)
-
-
-def current_phase(epoch_idx: int, cfg: dict) -> str:
-    p1 = int(cfg['training'].get('phase1_epochs', 20))
-    p2 = int(cfg['training'].get('phase2_epochs', 20))
-    if epoch_idx < p1:
-        return 'phase1_global_stability'
-    if epoch_idx < p1 + p2:
-        return 'phase2_tail_sharpening'
-    return 'phase3_rno_finetune'
-
-
-def objective_loss(pred: torch.Tensor, target: torch.Tensor, cfg: dict, bounds: dict | None, epoch_idx: int) -> torch.Tensor:
-    phase = current_phase(epoch_idx, cfg)
-    if phase == 'phase1_global_stability':
-        return mse_loss(pred, target)
-    if phase == 'phase2_tail_sharpening':
-        return weighted_mae_phys_loss(pred, target, cfg, bounds)
-    return smooth_tail_loss(pred, target, cfg, bounds)
-
-
-def get_optimizer(cfg, model, steps_per_epoch):
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg['training']['lr'],
-        weight_decay=cfg['training']['weight_decay'],
-    )
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=cfg['training']['lr'],
-        steps_per_epoch=steps_per_epoch,
-        epochs=cfg['training']['epochs'],
-        pct_start=cfg['training']['pct_start'],
-    )
-    return optimizer, scheduler
-
-
-def _physics_feature_index(cfg: dict, xb: torch.Tensor, name: str) -> int | None:
-    feature_names = cfg.get('features', {}).get('all', [])
-    if name not in feature_names:
-        return None
-    idx = feature_names.index(name)
-    if idx >= xb.shape[1]:
-        return None
-    return idx
-
-
-def compute_physics_loss(pred: torch.Tensor, xb: torch.Tensor, cfg: dict) -> torch.Tensor:
-    physics_cfg = cfg.get('physics', {})
-    if not bool(physics_cfg.get('enabled', False)):
-        return torch.zeros((), device=pred.device, dtype=pred.dtype)
-
-    kappa = float(physics_cfg.get('diffusivity', 0.05))
-    source_weight = float(physics_cfg.get('source_weight', 0.0))
-    eps = float(physics_cfg.get('epsilon', 1e-8))
-
-    grad_h = torch.gradient(pred, dim=1)[0]
-    grad_w = torch.gradient(pred, dim=2)[0]
-    laplacian = torch.gradient(grad_h, dim=1)[0] + torch.gradient(grad_w, dim=2)[0]
-
-    cpm_idx = _physics_feature_index(cfg, xb, 'cpm25')
-    last_c = xb[:, cpm_idx, cfg['time']['t_in_cpm'] - 1, :, :].unsqueeze(-1) if cpm_idx is not None else torch.zeros_like(pred[..., :1])
-    dC_dt = torch.empty_like(pred)
-    dC_dt[..., :1] = pred[..., :1] - last_c
-    dC_dt[..., 1:] = pred[..., 1:] - pred[..., :-1]
-
-    u_idx = _physics_feature_index(cfg, xb, 'u10')
-    v_idx = _physics_feature_index(cfg, xb, 'v10')
-    if u_idx is None or v_idx is None:
-        advection = torch.zeros_like(pred)
-    else:
-        u = xb[:, u_idx, -1, :, :].unsqueeze(-1)
-        v = xb[:, v_idx, -1, :, :].unsqueeze(-1)
-        advection = u * grad_h + v * grad_w
-
-    source = torch.zeros_like(pred)
-    if source_weight > 0:
-        pm_idx = _physics_feature_index(cfg, xb, 'PM25')
-        if pm_idx is not None:
-            source = source_weight * xb[:, pm_idx, -1, :, :].unsqueeze(-1)
-
-    residual = dC_dt + advection - (kappa * laplacian) - source
-    return torch.mean(residual * residual + eps)
-
-
-def check_persistence_gate(val_rmse_phys: float, epoch: int) -> None:
-    gap = val_rmse_phys - PERSISTENCE_RMSE_PHYS
-    if gap > 0:
-        print(f'  ⚠  Persistence gate NOT met at epoch {epoch}: val_rmse_phys={val_rmse_phys:.3f} > {PERSISTENCE_RMSE_PHYS:.2f} (gap={gap:+.3f})')
-    else:
-        print(f'  ✓  Persistence gate MET at epoch {epoch}: val_rmse_phys={val_rmse_phys:.3f} < {PERSISTENCE_RMSE_PHYS:.2f} (gap={gap:+.3f})')
-
-
-def persistence_rmse_from_batch(xb: torch.Tensor, yb: torch.Tensor, cfg: dict, bounds: dict | None) -> torch.Tensor:
+def persistence_rmse_from_batch(xb, yb, cfg, bounds):
     last_obs = xb[:, 0, cfg['time']['t_in_cpm'] - 1]
     persist = last_obs[..., None].repeat(1, 1, 1, yb.shape[-1])
     return physical_rmse_metric(persist, yb, cfg, bounds)
 
-
-def _forward_model(model, xb: torch.Tensor, autoregressive: bool, detach_feedback: bool = False) -> torch.Tensor:
-    if autoregressive and hasattr(model, 'rollout'):
-        return model.rollout(xb, detach_feedback=detach_feedback)
-    if not autoregressive and hasattr(model, 'forward_parallel'):
-        return model.forward_parallel(xb)
-    return model(xb)
-
+def get_optimizer(cfg, model, steps_per_epoch):
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg['training']['lr'], weight_decay=cfg['training']['weight_decay'])
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=cfg['training']['lr'], steps_per_epoch=steps_per_epoch, epochs=cfg['training']['epochs'], pct_start=cfg['training'].get('pct_start', 0.1))
+    return optimizer, scheduler
 
 def train(cfg, model, train_dl, val_dl, bounds: dict = None, wandb_run=None):
     device = cfg['device']
     epochs = cfg['training']['epochs']
-    patience = cfg['training'].get('patience', 8)
-    grad_clip = cfg['training']['grad_clip']
-    save_path = cfg['paths']['model_save']
-    use_amp = bool(cfg['training'].get('use_amp', True) and device.type == 'cuda')
-    lambda_d = float(cfg['training'].get('lambda_d', 1.0))
-    lambda_p = float(cfg['training'].get('lambda_p', 0.0))
-    detach_feedback = bool(cfg['training'].get('phase3_detach_feedback', False))
+    patience = cfg['training'].get('patience', 12)
+    grad_clip = cfg['training'].get('grad_clip', 1.0)
+
+    requested_amp = bool(cfg['training'].get('use_amp', False) and device.type == 'cuda')
+    has_complex_params = any(p.is_complex() for p in model.parameters())
+    use_amp = requested_amp and not has_complex_params
+    if requested_amp and has_complex_params:
+        print("AMP disabled automatically: model has complex-valued parameters (TFNO spectral weights).")
 
     optimizer, scheduler = get_optimizer(cfg, model, len(train_dl))
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    
+    if hasattr(torch, 'amp') and hasattr(torch.amp, 'GradScaler'):
+        scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
-    history = {
-        'phase': [],
-        'train_loss': [],
-        'val_loss': [],
-        'train_objective': [],
-        'train_physics': [],
-        'val_objective': [],
-        'val_physics': [],
-        'val_persistence_phys': [],
-        'val_phys_rmse': [],
-        'selection_metric': [],
-    }
+    feat_to_idx = {name: i for i, name in enumerate(cfg.get('features', {}).get('input', []))}
+
+    def diffusion_loss(pred, xb=None, eps=1e-8):
+        # pred: (B, H, W, T) — Laplacian over spatial dims
+        p = pred.permute(0, 3, 1, 2)  # (B, T, H, W)
+        lap = (p[:, :, 2:, 1:-1] + p[:, :, :-2, 1:-1] +
+               p[:, :, 1:-1, 2:] + p[:, :, 1:-1, :-2] -
+               4 * p[:, :, 1:-1, 1:-1])
+
+        if xb is None or ('u10' not in feat_to_idx) or ('v10' not in feat_to_idx):
+            return torch.mean(lap ** 2)
+
+        u_idx = feat_to_idx['u10']
+        v_idx = feat_to_idx['v10']
+        u = xb[:, u_idx, -1, :, :]
+        v = xb[:, v_idx, -1, :, :]
+        wind_speed = torch.sqrt(torch.clamp(u * u + v * v, min=0.0))
+        calm_threshold = float(cfg.get('physics', {}).get('calm_wind_threshold', 0.5))
+        calm_mask = (wind_speed <= calm_threshold).float()[:, None, 1:-1, 1:-1]
+        weighted = (lap ** 2) * calm_mask
+        denom = torch.clamp(calm_mask.mean(), min=eps)
+        return weighted.mean() / denom
+
+    lambda_p = cfg['training'].get('lambda_p', 0.0)
+
     best_metric = float('inf')
     patience_count = 0
     start_epoch = 0
 
+    history = {
+        'train_loss': [], 'val_loss': [], 'train_objective': [],
+        'val_objective': [], 'val_phys_rmse': [], 'val_persistence_phys': [],
+        'selection_metric': []
+    }
+
     resumed_history = None
     if _checkpoint_enabled(cfg):
-        start_epoch, best_metric, patience_count, resumed_history = _try_resume_training_state(
-            cfg, model, optimizer, scheduler, scaler
-        )
-        if isinstance(resumed_history, dict):
-            history = resumed_history
+        start_epoch, best_metric, patience_count, resumed_history = _try_resume_training_state(cfg, model, optimizer, scheduler, scaler)
+        if isinstance(resumed_history, dict): history = resumed_history
 
-    if wandb_run is not None and _WANDB_AVAILABLE:
-        _wandb.watch(model, log='gradients', log_freq=max(1, len(train_dl) * 2))
-
-    print(f"\n{'─' * 72}")
-    print(f"3-phase schedule: {cfg['training'].get('phase1_epochs', 20)} + {cfg['training'].get('phase2_epochs', 20)} + {cfg['training'].get('phase3_epochs', 10)} epochs")
-    print(f"Global persistence reference: {PERSISTENCE_RMSE_PHYS:.2f} µg/m³")
-    if lambda_p > 0 and bool(cfg.get('physics', {}).get('enabled', False)):
-        print(f"Physics loss enabled: λ_d={lambda_d:.3f}, λ_p={lambda_p:.3f}")
-    print(f"{'─' * 72}\n")
+    print(f"\n{'─'*70}")
+    print("Starting Simple 1-Phase Training Baseline")
+    print(f"Global Persistence (Physical): {PERSISTENCE_RMSE_PHYS:.2f} µg/m³")
+    print(f"{'─'*70}\n")
 
     for epoch in range(start_epoch, epochs):
-        phase = current_phase(epoch, cfg)
-        use_autoregressive = phase == 'phase3_rno_finetune'
-
         model.train()
-        train_obj_vals = []
-        train_rmse_vals = []
-        train_phys_loss_vals = []
-        total_grad_norm = 0.0
-        num_batches = 0
+        train_losses, train_rmse_std = [], []
 
         for xb, yb in train_dl:
             xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad(set_to_none=True)
-            amp_ctx = torch.autocast(device_type='cuda', dtype=torch.float16) if use_amp else nullcontext()
+            
+            if use_amp:
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    pred = model(xb)
+                    pred = torch.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
+                    loss = rmse_loss(pred, yb)
+                    if lambda_p > 0:
+                        loss = loss + lambda_p * diffusion_loss(pred, xb)
 
-            with amp_ctx:
-                pred = _forward_model(model, xb, autoregressive=use_autoregressive, detach_feedback=detach_feedback)
-                data_loss = objective_loss(pred, yb, cfg, bounds, epoch_idx=epoch)
-                physics_loss = compute_physics_loss(pred, xb, cfg)
-                loss = (lambda_d * data_loss) + (lambda_p * physics_loss)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                pred = model(xb)
+                pred = torch.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
+                loss = rmse_loss(pred, yb)
+                if lambda_p > 0:
+                    loss = loss + lambda_p * diffusion_loss(pred, xb)
 
-            rmse_std = rmse_loss(pred.detach(), yb)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            total_grad_norm += float(grad_norm)
-            num_batches += 1
-            scaler.step(optimizer)
-            scaler.update()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
             scheduler.step()
 
-            train_obj_vals.append(float(loss.item()))
-            train_rmse_vals.append(float(rmse_std.item()))
-            train_phys_loss_vals.append(float(physics_loss.detach().item()))
+            train_losses.append(loss.item())
+            train_rmse_std.append(loss.item())
 
         model.eval()
-        val_rmse_std_vals = []
-        val_obj_vals = []
-        val_phys_vals = []
-        val_phys_rmse_vals = []
-        val_persist_vals = []
-        horizon_rmse_accum = []
-
+        val_losses, val_phys, val_persist = [], [], []
         with torch.no_grad():
             for xb, yb in val_dl:
                 xb, yb = xb.to(device), yb.to(device)
-                pred = _forward_model(model, xb, autoregressive=use_autoregressive, detach_feedback=False)
-                val_rmse_std_vals.append(float(rmse_loss(pred, yb).item()))
-                val_obj_vals.append(float(objective_loss(pred, yb, cfg, bounds, epoch_idx=epoch).item()))
-                val_phys_vals.append(float(compute_physics_loss(pred, xb, cfg).item()))
-                val_phys_rmse_vals.append(float(physical_rmse_metric(pred, yb, cfg, bounds).item()))
-                val_persist_vals.append(float(persistence_rmse_from_batch(xb, yb, cfg, bounds).item()))
-                horizon_rmse_accum.append(rmse_per_horizon(pred, yb))
+                pred = model(xb)
+                pred = torch.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
+                
+                val_losses.append(rmse_loss(pred, yb).item())
+                val_phys.append(physical_rmse_metric(pred, yb, cfg, bounds).item())
+                val_persist.append(persistence_rmse_from_batch(xb, yb, cfg, bounds).item())
 
-        train_loss = float(np.mean(train_rmse_vals))
-        train_objective = float(np.mean(train_obj_vals))
-        train_physics = float(np.mean(train_phys_loss_vals)) if train_phys_loss_vals else 0.0
-        val_loss = float(np.mean(val_rmse_std_vals))
-        val_objective = float(np.mean(val_obj_vals))
-        val_physics = float(np.mean(val_phys_vals)) if val_phys_vals else 0.0
-        val_phys_rmse = float(np.mean(val_phys_rmse_vals))
-        val_persistence_phys = float(np.mean(val_persist_vals))
-        persistence_ratio = val_phys_rmse / max(val_persistence_phys, 1e-8)
-        current_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else optimizer.param_groups[0]['lr']
-        avg_grad_norm = total_grad_norm / max(num_batches, 1)
+        t_loss = float(np.mean(train_losses))
+        v_loss = float(np.mean(val_losses))
+        v_phys = float(np.mean(val_phys))
+        v_pers = float(np.mean(val_persist))
 
-        metric_mode = str(cfg['training'].get('checkpoint_metric', 'val_rmse_phys')).lower()
-        if metric_mode == 'val_objective':
-            selection_metric = val_objective
-        elif metric_mode == 'mixed':
-            alpha = float(cfg['training'].get('checkpoint_mixed_alpha', 0.5))
-            selection_metric = alpha * val_objective + (1.0 - alpha) * val_phys_rmse
-        else:
-            selection_metric = val_phys_rmse
+        history['train_loss'].append(float(np.mean(train_rmse_std)))
+        history['train_objective'].append(t_loss)
+        history['val_loss'].append(v_loss)
+        history['val_objective'].append(v_loss)
+        history['val_phys_rmse'].append(v_phys)
+        history['val_persistence_phys'].append(v_pers)
+
+        selection_metric = v_loss if cfg['training'].get('checkpoint_metric', 'val_rmse_std') == 'val_rmse_std' else v_phys
+        history['selection_metric'].append(selection_metric)
 
         improved = selection_metric < best_metric
         if improved:
             best_metric = selection_metric
             patience_count = 0
-            torch.save(model.state_dict(), save_path)
             tag = '  ← saved'
         else:
             patience_count += 1
             tag = f'  (no improvement {patience_count}/{patience})'
 
-        history['phase'].append(phase)
-        history['train_loss'].append(train_loss)
-        history['val_loss'].append(val_loss)
-        history['train_objective'].append(train_objective)
-        history['train_physics'].append(train_physics)
-        history['val_objective'].append(val_objective)
-        history['val_physics'].append(val_physics)
-        history['val_persistence_phys'].append(val_persistence_phys)
-        history['val_phys_rmse'].append(val_phys_rmse)
-        history['selection_metric'].append(selection_metric)
-
         print(
-            f"Epoch {epoch + 1:3d}/{epochs} | {phase} | "
-            f"TrainObj: {train_objective:.4f} | TrainRMSE(std): {train_loss:.4f} | "
-            f"ValRMSE(std): {val_loss:.4f} | ValRMSE(phys): {val_phys_rmse:.3f} | "
-            f"ValPersist: {val_persistence_phys:.3f} | Ratio: {persistence_ratio:.3f} | "
-            f"Sel: {selection_metric:.4f} | Best: {best_metric:.4f}{tag}"
+            f"Epoch {epoch+1:3d}/{epochs} | "
+            f"Train RMSE(std): {t_loss:.4f} | "
+            f"Val RMSE(std): {v_loss:.4f} | "
+            f"Val RMSE(phys): {v_phys:.3f} µg/m³ | "
+            f"Sel: {selection_metric:.4f}{tag}"
         )
 
-        if wandb_run is not None and _WANDB_AVAILABLE:
-            log_dict = {
+        if wandb_run and _WANDB_AVAILABLE:
+            wandb_run.log({
                 'epoch': epoch + 1,
-                'phase/id': 1 if phase.startswith('phase1') else 2 if phase.startswith('phase2') else 3,
-                'train/objective': train_objective,
-                'train/rmse_std': train_loss,
-                'train/physics': train_physics,
-                'val/objective': val_objective,
-                'val/rmse_std': val_loss,
-                'val/rmse_phys': val_phys_rmse,
-                'val/physics': val_physics,
-                'val/persistence_phys': val_persistence_phys,
-                'val/persistence_ratio': persistence_ratio,
-                'lr': current_lr,
-                'grad_norm': avg_grad_norm,
+                'train/rmse_std': t_loss,
+                'val/rmse_std': v_loss,
+                'val/rmse_phys': v_phys,
+                'val/persistence_phys': v_pers,
                 'best/selection_metric': best_metric,
-                'best/val_rmse_phys': min(history['val_phys_rmse']),
-            }
-            if horizon_rmse_accum:
-                avg_horizon = torch.stack(horizon_rmse_accum, dim=0).mean(0)
-                for t_idx, v in enumerate(avg_horizon.cpu().tolist()):
-                    log_dict[f'horizon/val_rmse_h{t_idx + 1:02d}'] = v
-            if improved and bool(cfg.get('wandb', {}).get('log_model', True)):
-                artifact = _wandb.Artifact(
-                    name=f'best_model-{wandb_run.id}',
-                    type='model',
-                    description=f'Best checkpoint — epoch {epoch + 1}, val_rmse_phys={val_phys_rmse:.4f}',
-                    metadata={
-                        'epoch': epoch + 1,
-                        'phase': phase,
-                        'val_rmse_phys': val_phys_rmse,
-                        'selection_metric': selection_metric,
-                    },
-                )
-                artifact.add_file(save_path)
-                wandb_run.log_artifact(artifact)
-            wandb_run.log(log_dict)
+            })
 
-        if (epoch + 1) % 5 == 0:
-            check_persistence_gate(val_phys_rmse, epoch + 1)
-
-        ckpt_every = _checkpoint_every(cfg)
-        if ckpt_every > 0 and ((epoch + 1) % ckpt_every == 0):
-            _save_training_checkpoint(
-                cfg=cfg,
-                epoch_1based=epoch + 1,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=scaler,
-                history=history,
-                best_metric=best_metric,
-                patience_count=patience_count,
-            )
+        # Always save last checkpoint; also save best checkpoint when improved
+        _save_training_checkpoint(cfg, epoch + 1, model, optimizer, scheduler, scaler, history, best_metric, patience_count, is_best=improved)
 
         if patience_count >= patience:
-            print(f'\nEarly stopping triggered after {epoch + 1} epochs (no improvement for {patience} epochs).')
+            print(f"Early stopping triggered after {epoch+1} epochs.")
             break
 
-    print(f"\n{'─' * 72}")
-    best_idx = int(np.argmin(np.asarray(history['selection_metric'])))
-    print(f"Training complete. Best epoch: {best_idx + 1} ({history['phase'][best_idx]})")
-    print(f"Best val RMSE (std-space): {history['val_loss'][best_idx]:.4f}")
-    print(f"Best val RMSE (physical):  {history['val_phys_rmse'][best_idx]:.3f} µg/m³")
-    check_persistence_gate(history['val_phys_rmse'][best_idx], best_idx + 1)
-
-    if _checkpoint_enabled(cfg):
-        _save_training_checkpoint(
-            cfg=cfg,
-            epoch_1based=len(history['val_loss']),
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            scaler=scaler,
-            history=history,
-            best_metric=best_metric,
-            patience_count=patience_count,
-        )
-
-    print(f"{'─' * 72}")
+    print(f"\n{'─'*70}")
+    best_idx = int(np.argmin(history['selection_metric']))
+    print(f"Training complete. Best epoch: {best_idx + 1}")
+    print(f"Best Val RMSE (std):  {history['val_loss'][best_idx]:.4f}")
+    print(f"Best Val RMSE (phys): {history['val_phys_rmse'][best_idx]:.3f} µg/m³")
+    print(f"{'─'*70}")
     return history
 
-
 metric_loss = rmse_loss
-

@@ -4,64 +4,69 @@
 
 paths:
   # Kaggle paths (used when /kaggle exists)
-  data:       "/kaggle/input/datasets/khushisingh942004/aisehack"
-  temp:       "/kaggle/temp"
-  model_save: "/kaggle/temp/best_model.pt"
-  checkpoint_dir: "/kaggle/temp/checkpoints"
-  checkpoint_last: "/kaggle/temp/checkpoints/last_checkpoint.pt"
-  output:     "/kaggle/working/preds.npy"
+  data: "/kaggle/input/datasets/khushisingh942004/aisehack"
+  temp: "/kaggle/working"
+  model_save: "/kaggle/working/best_model.pt"
+  checkpoint_dir: "/kaggle/working"
+  checkpoint_last: "/kaggle/working/last_checkpoint.pt"
+  output: "/kaggle/working/preds.npy"
   # Local paths (auto-applied in config.py when not on Kaggle)
   data_local: "/home/raj/Documents/CODING/Hackathon/ANRF_AISEHack_Code/aisehack-theme-2"
 
 features:
-  met:  ["pblh", "t2", "u10", "v10", "q2", "rain"]
-  emis: ["PM25", "NOx"]
-  aux:  ["hour_sin", "hour_cos", "ventilation_index", "wind_convergence", "rain_mask", "land_mask"]
+  met: ["pblh", "t2", "u10", "v10", "q2", "rain"]
+  emis: ["PM25", "NOx", "NH3"]
+  aux: ["hour_sin", "hour_cos", "rain_mask", "NMVOC_finn_mask"]
   use_aux: true
 
 time:
-  t_in_cpm: 10    # cpm25 history hours available at test time
-  t_in_met: 26    # met/emis input window (10 past + 16 NWP forecast)
-  t_out:    16    # forecast horizon
+  t_in_cpm: 10 # cpm25 history hours available at test time
+  t_in_met: 26 # met/emis input window (10 past + 16 NWP forecast)
+  t_out: 16 # forecast horizon
   stride_train: 2
-  stride_val:   4
+  stride_val: 4
 
 data:
-  months:      ["APRIL_16", "JULY_16", "OCT_16", "DEC_16"]
-  val_month:   "OCT_16"
+  months: ["APRIL_16", "JULY_16", "OCT_16", "DEC_16"]
+  val_month: "DEC_16"
+  val_tail_fraction: 0.2
   test_samples: 996
 
 preprocessing:
   normalization: grid_log_standardize
   use_mmap: true
+  temporal_gap_hours: 12
   grid_chunk_size: 48
   grid_stats_filename: grid_log_scaler_2016.npz
   grid_stats_eps: 1.0e-6
   auto_build_grid_stats: true
+  grid_stats_train_only: true
+  enforce_grid_stats_train_months: true
   signed_log_for_negative: true
   log_eps: 1.0e-12
   log1p_features: ["cpm25", "rain", "ventilation_index"]
-  log_eps_features: ["PM25", "SO2", "NOx", "NH3", "NMVOC_e", "NMVOC_finn", "bio"]
+  log_eps_features:
+    ["PM25", "SO2", "NOx", "NH3", "NMVOC_e", "NMVOC_finn", "bio"]
   signed_log_features: ["u10", "v10", "wind_convergence"]
   sparse_mask_features: ["rain", "NMVOC_finn"]
   sparse_mask_threshold: 0.0
   aux_standardize_features: ["ventilation_index", "wind_convergence"]
-  derived_features: ["ventilation_index", "wind_convergence"]
-  add_land_mask: true
+  derived_features: []
+  add_land_mask: false
   land_mask_file: ""
   feature_time_limits:
     cpm25: 10
 
 # ── Persistence baseline (from EDA) — values in *normalized* [0,1] space ──
 persistence:
-  rmse_normalized: 0.0208   # avg RMSE at t+16
-  rmse_physical:   30.83    # µg/m³  (threshold model must beat)
+  rmse_normalized: 0.0208 # avg RMSE at t+16
+  rmse_physical: 30.83 # µg/m³  (threshold model must beat)
 
 model:
-  type:    "physics_frno"
-  width:   64
-  modes:   20
-  depth:   6
+  type: "physics_frno"
+  width: 64
+  modes: 20
+  depth: 6
   rank_ratio: 0.4
   alpha_init: 0.35
   dropout: 0.05
@@ -82,38 +87,38 @@ models:
     dropout: 0.05
 
 training:
-  phase1_epochs:    20
-  phase2_epochs:    20
-  phase3_epochs:    10
-  epochs:           50
-  patience:         12
-  batch_size_train: 8
-  batch_size_val:   8
-  batch_size_test:  16
-  lr:               5.0e-4
-  weight_decay:     2.0e-4
-  pct_start:        0.1        # OneCycleLR warmup fraction
-  grad_clip:        1.0
-  num_workers:      2
-  pin_memory:       true
-  seed:             42
-  use_amp:          true
-  lambda_d:         1.0
-  lambda_p:         0.02
+  phase1_epochs: 20
+  phase2_epochs: 20
+  phase3_epochs: 10
+  epochs: 50
+  patience: 15
+  batch_size_train: 4
+  batch_size_val: 8
+  batch_size_test: 16
+  lr: 5.0e-4
+  weight_decay: 2.0e-4
+  pct_start: 0.15 # OneCycleLR warmup fraction
+  grad_clip: 1.0
+  num_workers: 2
+  pin_memory: true
+  seed: 42
+  use_amp: false
+  lambda_d: 1.0
+  lambda_p: 0.02
   use_weighted_sampler: true
   default_sampling_weight: 1.0
   checkpoint_metric: val_rmse_phys
   enable_checkpointing: true
   checkpoint_every_epochs: 5
-  resume_if_available: true
+  resume_if_available: false
   resume_checkpoint_path: ""
   checkpoint_mixed_alpha: 0.5
   phase3_detach_feedback: false
   month_sampling_weights:
     APRIL_16: 0.5
     JULY_16: 0.5
-    OCT_16: 1.0
-    DEC_16: 2.0
+    OCT_16: 1.5
+    DEC_16: 3.0
 
 loss:
   type: three_phase
@@ -134,11 +139,11 @@ inference:
 # ── Weights & Biases ──────────────────────────────────────────────────────────
 wandb:
   enabled: true
-  entity:  "ronitraj"
+  entity: "ronitraj"
   project: "aisehack"
   # Leave run_name blank to auto-generate
   run_name: ""
-  tags:     ["pm25", "frno", "physics", "aisehack"]
+  tags: ["pm25", "frno", "physics", "aisehack"]
   # Log the best checkpoint as a W&B artifact
   log_model: true
   # How often (epochs) to log per-horizon RMSE heatmap

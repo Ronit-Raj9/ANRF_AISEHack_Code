@@ -435,22 +435,33 @@ class _SpectralConv2d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
-        x_ft = torch.fft.rfft2(x, norm='ortho')
+        in_dtype = x.dtype
+        x_fft = x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
+        x_ft = torch.fft.rfft2(x_fft, norm='ortho')
+
+        m1 = min(self.modes1, H)
+        m2 = min(self.modes2, (W // 2) + 1)
+
+        w_pos = self.weight_pos.to(dtype=x_ft.dtype)
+        w_neg = self.weight_neg.to(dtype=x_ft.dtype)
         out_ft = torch.zeros(
             B, self.weight_pos.shape[1], H, W // 2 + 1,
-            dtype=torch.cfloat, device=x.device,
+            dtype=x_ft.dtype, device=x.device,
         )
-        out_ft[:, :, :self.modes1, :self.modes2] = torch.einsum(
+        out_ft[:, :, :m1, :m2] = torch.einsum(
             'bixy,ioxy->boxy',
-            x_ft[:, :, :self.modes1, :self.modes2],
-            self.weight_pos,
+            x_ft[:, :, :m1, :m2],
+            w_pos[:, :, :m1, :m2],
         )
-        out_ft[:, :, -self.modes1:, :self.modes2] = torch.einsum(
+        out_ft[:, :, -m1:, :m2] = torch.einsum(
             'bixy,ioxy->boxy',
-            x_ft[:, :, -self.modes1:, :self.modes2],
-            self.weight_neg,
+            x_ft[:, :, -m1:, :m2],
+            w_neg[:, :, :m1, :m2],
         )
-        return torch.fft.irfft2(out_ft, s=(H, W), norm='ortho')
+        y = torch.fft.irfft2(out_ft, s=(H, W), norm='ortho')
+        if y.dtype != in_dtype:
+            y = y.to(dtype=in_dtype)
+        return y
 
 
 class _FNOBlock(nn.Module):
@@ -471,8 +482,18 @@ class TFNO2D(nn.Module):
     """Tucker-factorized FNO2D.  Same interface as UNet."""
 
     def __init__(self, in_channels: int, out_steps: int = 16,
-                 width: int = 64, modes: int = 24, depth: int = 6):
+                 width: int = 64, modes: int = 24, depth: int = 6,
+                 t_in_cpm: int = 10,
+                 use_residual_anchor: bool = False,
+                 use_reflect_pad: bool = False,
+                 pad_h: int = 4,
+                 pad_w: int = 4):
         super().__init__()
+        self.t_in_cpm = int(t_in_cpm)
+        self.use_residual_anchor = bool(use_residual_anchor)
+        self.use_reflect_pad = bool(use_reflect_pad)
+        self.pad_h = int(pad_h)
+        self.pad_w = int(pad_w)
         self.lift   = nn.Conv2d(in_channels, width, 1)
         self.blocks = nn.ModuleList([_FNOBlock(width, modes) for _ in range(depth)])
         self.proj   = nn.Sequential(
@@ -480,14 +501,53 @@ class TFNO2D(nn.Module):
             nn.Conv2d(width * 2, out_steps, 1),
         )
 
+    @staticmethod
+    def _reflect_pad_4d(x: torch.Tensor, pad_h: int, pad_w: int) -> tuple[torch.Tensor, tuple[int, int]]:
+        """Version-safe reflect padding for 4D tensors (B,C,H,W), bottom/right only."""
+        H0, W0 = x.shape[-2], x.shape[-1]
+        if pad_w > 0:
+            if W0 <= 1 or pad_w > (W0 - 1):
+                raise ValueError(f'Invalid reflect width pad={pad_w} for W={W0}')
+            w_idx = torch.cat([
+                torch.arange(W0, device=x.device),
+                torch.arange(W0 - 2, W0 - 2 - pad_w, -1, device=x.device),
+            ])
+            x = x.index_select(-1, w_idx)
+        if pad_h > 0:
+            if H0 <= 1 or pad_h > (H0 - 1):
+                raise ValueError(f'Invalid reflect height pad={pad_h} for H={H0}')
+            h_idx = torch.cat([
+                torch.arange(H0, device=x.device),
+                torch.arange(H0 - 2, H0 - 2 - pad_h, -1, device=x.device),
+            ])
+            x = x.index_select(-2, h_idx)
+        return x, (H0, W0)
+
+    @staticmethod
+    def _crop_output(y: torch.Tensor, spatial_shape: tuple[int, int]) -> torch.Tensor:
+        H0, W0 = spatial_shape
+        return y[:, :H0, :W0, :]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, T, H, W = x.shape
+        anchor = x[:, 0, self.t_in_cpm - 1] if self.use_residual_anchor else None
+
         x = x.reshape(B, C * T, H, W)
+        orig_shape = (H, W)
+        if self.use_reflect_pad and (self.pad_h > 0 or self.pad_w > 0):
+            x, orig_shape = self._reflect_pad_4d(x, pad_h=self.pad_h, pad_w=self.pad_w)
+
         x = self.lift(x)
         for block in self.blocks:
             x = block(x)
-        x = self.proj(x)                  # (B, T_out, H, W)
-        return x.permute(0, 2, 3, 1)      # (B, H, W, T_out)
+        x = self.proj(x)                  # (B, T_out, Hp, Wp)
+        out = x.permute(0, 2, 3, 1)       # (B, Hp, Wp, T_out)
+
+        if self.use_reflect_pad and (self.pad_h > 0 or self.pad_w > 0):
+            out = self._crop_output(out, orig_shape)
+        if anchor is not None:
+            out = out + anchor[..., None]
+        return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -532,12 +592,18 @@ class _TuckerSpectralKernel2d(nn.Module):
 
     def reconstruct(self, positive: bool = True) -> torch.Tensor:
         core = self.core_pos if positive else self.core_neg
+        # Keep all operands complex64 to avoid AMP half/complex dtype conflicts
+        # during einsum on some CUDA/PyTorch builds.
+        in_factor = self.in_factor.to(dtype=core.dtype)
+        out_factor = self.out_factor.to(dtype=core.dtype)
+        m1_factor = self.m1_factor.to(dtype=core.dtype)
+        m2_factor = self.m2_factor.to(dtype=core.dtype)
         return torch.einsum(
             'ia,ob,xc,yd,abcd->ioxy',
-            self.in_factor.to(dtype=core.real.dtype),
-            self.out_factor.to(dtype=core.real.dtype),
-            self.m1_factor.to(dtype=core.real.dtype),
-            self.m2_factor.to(dtype=core.real.dtype),
+            in_factor,
+            out_factor,
+            m1_factor,
+            m2_factor,
             core,
         )
 
@@ -762,7 +828,27 @@ class PhysicsFrNO(nn.Module):
         """Reflect-pad (140,124) -> (144,128) by default for FNO boundary alignment."""
         H0, W0 = x.shape[-2], x.shape[-1]
         if pad_h > 0 or pad_w > 0:
-            x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
+            # Version-safe reflect padding without F.pad non-constant mode on 5D tensors.
+            # Pads only bottom/right spatial edges to align 140x124 -> 144x128.
+            if x.dim() != 5:
+                raise ValueError(f'Expected 5D tensor (B,C,T,H,W), got shape {tuple(x.shape)}')
+            _, _, _, H, W = x.shape
+            if pad_w > 0:
+                if W <= 1 or pad_w > (W - 1):
+                    raise ValueError(f'Invalid reflect width pad={pad_w} for W={W}')
+                w_idx = torch.cat([
+                    torch.arange(W, device=x.device),
+                    torch.arange(W - 2, W - 2 - pad_w, -1, device=x.device),
+                ])
+                x = x.index_select(-1, w_idx)
+            if pad_h > 0:
+                if H <= 1 or pad_h > (H - 1):
+                    raise ValueError(f'Invalid reflect height pad={pad_h} for H={H}')
+                h_idx = torch.cat([
+                    torch.arange(H, device=x.device),
+                    torch.arange(H - 2, H - 2 - pad_h, -1, device=x.device),
+                ])
+                x = x.index_select(-2, h_idx)
         return x, (H0, W0)
 
     @staticmethod
@@ -869,6 +955,11 @@ def build_model(cfg) -> nn.Module:
             width       = cfg['model']['width'],
             modes       = cfg['model']['modes'],
             depth       = cfg['model']['depth'],
+            t_in_cpm    = t_in_cpm,
+            use_residual_anchor = bool(cfg['model'].get('use_residual_anchor', False)),
+            use_reflect_pad = bool(cfg['model'].get('use_reflect_pad', False)),
+            pad_h = int(cfg['model'].get('pad_h', 4)),
+            pad_w = int(cfg['model'].get('pad_w', 4)),
         )
     elif mtype == 'res_stunet':
         model = MODEL_REGISTRY[mtype](
