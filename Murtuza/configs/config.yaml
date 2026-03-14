@@ -88,6 +88,14 @@ training:
   lambda_d: 1.0
   lambda_p: 0.02
   physics_warmup_epochs: 25
+  use_pft: true
+  pft_phase1_ratio: 0.7
+  pft_lr: 4.0e-4
+
+physics:
+  diffusivity: 1.0
+  dx: 1.0
+  dy: 1.0
 
 loss:
   use_spatial_hotspot_weight: true

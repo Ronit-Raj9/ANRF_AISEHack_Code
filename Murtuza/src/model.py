@@ -303,29 +303,44 @@ class _SpectralConv2d(nn.Module):
         self.modes1 = modes1
         self.modes2 = modes2
         scale = 1 / max(1, in_ch * out_ch)
-        self.weight_pos = nn.Parameter(
-            scale * torch.randn(in_ch, out_ch, modes1, modes2, dtype=torch.cfloat)
+        # Store spectral kernels as real-imag pairs and convert with view_as_complex
+        # so the rest of the pipeline remains real-valued and PyTorch-friendly.
+        self.weight_pos_ri = nn.Parameter(
+            scale * torch.randn(in_ch, out_ch, modes1, modes2, 2, dtype=torch.float32)
         )
-        self.weight_neg = nn.Parameter(
-            scale * torch.randn(in_ch, out_ch, modes1, modes2, dtype=torch.cfloat)
+        self.weight_neg_ri = nn.Parameter(
+            scale * torch.randn(in_ch, out_ch, modes1, modes2, 2, dtype=torch.float32)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
         x_ft = torch.fft.rfft2(x, norm='ortho')
+
+        # Complex kernels for explicit phase-shift learning (plume advection).
+        w_pos = torch.view_as_complex(self.weight_pos_ri.contiguous()).to(x_ft.dtype)
+        w_neg = torch.view_as_complex(self.weight_neg_ri.contiguous()).to(x_ft.dtype)
+
         out_ft = torch.zeros(
-            B, self.weight_pos.shape[1], H, W // 2 + 1,
-            dtype=torch.cfloat, device=x.device,
+            B, w_pos.shape[1], H, W // 2 + 1,
+            dtype=x_ft.dtype, device=x.device,
         )
-        out_ft[:, :, :self.modes1, :self.modes2] = torch.einsum(
+        out_ft_pos = torch.einsum(
             'bixy,ioxy->boxy',
             x_ft[:, :, :self.modes1, :self.modes2],
-            self.weight_pos,
+            w_pos,
         )
-        out_ft[:, :, -self.modes1:, :self.modes2] = torch.einsum(
+        out_ft_neg = torch.einsum(
             'bixy,ioxy->boxy',
             x_ft[:, :, -self.modes1:, :self.modes2],
-            self.weight_neg,
+            w_neg,
+        )
+
+        # Keep explicit real/imag views for numerical transparency and compatibility.
+        out_ft[:, :, :self.modes1, :self.modes2] = torch.view_as_complex(
+            torch.view_as_real(out_ft_pos).contiguous()
+        )
+        out_ft[:, :, -self.modes1:, :self.modes2] = torch.view_as_complex(
+            torch.view_as_real(out_ft_neg).contiguous()
         )
         return torch.fft.irfft2(out_ft, s=(H, W), norm='ortho')
 
@@ -342,6 +357,26 @@ class _FNOBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.gelu(self.norm(self.spectral(x) + self.bypass(x)))
+
+
+class _LocalConvBlock(nn.Module):
+    """Lightweight local spatial block for U-FNO high-frequency detail path."""
+
+    def __init__(self, width: int):
+        super().__init__()
+        g = min(8, width)
+        while width % g != 0 and g > 1:
+            g -= 1
+        self.conv1 = nn.Conv2d(width, width, 3, padding=1)
+        self.norm1 = nn.GroupNorm(g, width)
+        self.conv2 = nn.Conv2d(width, width, 3, padding=1)
+        self.norm2 = nn.GroupNorm(g, width)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = F.gelu(self.norm1(self.conv1(x)))
+        x = self.norm2(self.conv2(x))
+        return F.gelu(x + residual)
 
 
 class TFNO2D(nn.Module):
@@ -363,21 +398,43 @@ class TFNO2D(nn.Module):
         # Padding sizes to bring 140→144 and 124→128 (multiples of 8 / power-of-2)
         self._pad = (2, 2, 2, 2)   # (left, right, top, bottom) for F.pad
         self.lift   = nn.Conv2d(in_channels, width, 1)
+        self.local_lift = nn.Conv2d(in_channels, width, 3, padding=1)
         self.blocks = nn.ModuleList([_FNOBlock(width, modes) for _ in range(depth)])
+        self.local_blocks = nn.ModuleList([_LocalConvBlock(width) for _ in range(depth)])
+        self.fuse_blocks = nn.ModuleList([nn.Conv2d(width * 2, width, 1) for _ in range(depth)])
         self.proj   = nn.Sequential(
-            nn.Conv2d(width, width * 2, 1), nn.GELU(),
+            nn.Conv2d(width * 2, width * 2, 1), nn.GELU(),
             nn.Conv2d(width * 2, out_steps, 1),
         )
+
+    def freeze_non_spectral(self) -> None:
+        """Freeze everything except spectral kernels for PFT phase-2."""
+        for p in self.parameters():
+            p.requires_grad = False
+        for block in self.blocks:
+            for p in block.spectral.parameters():
+                p.requires_grad = True
+
+    def unfreeze_all(self) -> None:
+        for p in self.parameters():
+            p.requires_grad = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, T, H, W = x.shape
         x = x.reshape(B, C * T, H, W)
         # ── Reflective padding (Topic 7): smooth boundary for FFT periodicity ──
         x = F.pad(x, self._pad, mode='reflect')        # (B, C*T, H+4, W+4)
-        x = self.lift(x)
-        for block in self.blocks:
-            x = block(x)
-        x = self.proj(x)                               # (B, T_out, H+4, W+4)
+        global_feat = self.lift(x)
+        local_feat = F.gelu(self.local_lift(x))
+
+        # U-FNO hybrid: Fourier branch captures global transport, CNN branch
+        # preserves local/high-frequency hotspot structure, fused via skip-concat.
+        for fno_block, local_block, fuse in zip(self.blocks, self.local_blocks, self.fuse_blocks):
+            global_feat = fno_block(global_feat)
+            local_feat = local_block(local_feat)
+            global_feat = F.gelu(fuse(torch.cat([global_feat, local_feat], dim=1)))
+
+        x = self.proj(torch.cat([global_feat, local_feat], dim=1))  # (B, T_out, H+4, W+4)
         # Crop back to original spatial dims
         x = x[:, :, 2:2+H, 2:2+W]                     # (B, T_out, H, W)
         if self.clamp_output:
@@ -412,6 +469,8 @@ def build_model(cfg) -> nn.Module:
     # Expect cfg['tensor_channels'] to be set before calling build_model
     input_channels = cfg.get('tensor_channels', cfg['features']['input_channels'])
     t_out      = cfg['time']['t_out']
+    t_in_cpm   = cfg['time'].get('t_in_cpm', 10)
+    n_features = cfg['features'].get('input_channels', cfg['features'].get('n_features', input_channels))
     mtype      = cfg['model'].get('type', 'tfno2d').lower()
     in_channels = input_channels
 

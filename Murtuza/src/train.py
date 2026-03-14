@@ -97,19 +97,33 @@ def get_spatial_weight_tensor(cfg: dict, device: torch.device, dtype: torch.dtyp
 # Optimizer & Scheduler
 # ─────────────────────────────────────────────
 
-def get_optimizer(cfg, model, steps_per_epoch):
+def get_optimizer(
+    cfg,
+    model,
+    steps_per_epoch,
+    params=None,
+    epochs_override: int | None = None,
+    lr_override: float | None = None,
+):
+    train_params = list(params) if params is not None else [p for p in model.parameters() if p.requires_grad]
+    if len(train_params) == 0:
+        raise RuntimeError("No trainable parameters passed to optimizer.")
+
+    lr_value = float(lr_override if lr_override is not None else cfg['training']['lr'])
+    total_epochs = int(epochs_override if epochs_override is not None else cfg['training']['epochs'])
+
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr           = cfg['training']['lr'],
+        train_params,
+        lr           = lr_value,
         weight_decay = cfg['training']['weight_decay'],
     )
     sched_type = cfg['training'].get('scheduler', 'coswr')
     if sched_type == 'onecycle':
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr           = cfg['training']['lr'],
+            max_lr           = lr_value,
             steps_per_epoch  = steps_per_epoch,
-            epochs           = cfg['training']['epochs'],
+            epochs           = total_epochs,
             pct_start        = cfg['training']['pct_start'],
         )
     else:  # 'coswr' — Cosine Annealing with Warm Restarts
@@ -119,13 +133,54 @@ def get_optimizer(cfg, model, steps_per_epoch):
             optimizer,
             T_0    = T_0,
             T_mult = T_mult,
-            eta_min = cfg['training']['lr'] * 1e-2,  # floor = 1% of initial LR
+            eta_min = lr_value * 1e-2,  # floor = 1% of initial LR
         )
     return optimizer, scheduler
 
 # ─────────────────────────────────────────────
 # PINO Physics-Informed Loss
 # ─────────────────────────────────────────────
+def _spectral_spatial_derivatives(
+    field: torch.Tensor,
+    dx: float = 1.0,
+    dy: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute exact spatial derivatives in Fourier space.
+
+    Parameters
+    ----------
+    field : (B, H, W, T)
+    dx, dy : grid spacing along H/W axes
+
+    Returns
+    -------
+    dfdh, dfdw, laplacian : each (B, H, W, T)
+    """
+    if field.ndim != 4:
+        raise ValueError(f"Expected field shape (B,H,W,T), got {field.shape}")
+
+    # FFT on spatial axes after moving T next to batch for efficient batched fft2.
+    x = field.permute(0, 3, 1, 2)  # (B, T, H, W)
+    B, T, H, W = x.shape
+    x_hat = torch.fft.fft2(x, dim=(-2, -1), norm='ortho')
+
+    k_h = (2.0 * np.pi) * torch.fft.fftfreq(H, d=float(dx), device=field.device, dtype=field.dtype)
+    k_w = (2.0 * np.pi) * torch.fft.fftfreq(W, d=float(dy), device=field.device, dtype=field.dtype)
+    k_h = k_h.view(1, 1, H, 1)
+    k_w = k_w.view(1, 1, 1, W)
+
+    ik_h = (1j * k_h).to(x_hat.dtype)
+    ik_w = (1j * k_w).to(x_hat.dtype)
+    k2 = (k_h ** 2 + k_w ** 2).to(x_hat.dtype)
+
+    dfdh = torch.fft.ifft2(ik_h * x_hat, dim=(-2, -1), norm='ortho').real
+    dfdw = torch.fft.ifft2(ik_w * x_hat, dim=(-2, -1), norm='ortho').real
+    lap = torch.fft.ifft2(-k2 * x_hat, dim=(-2, -1), norm='ortho').real
+
+    return dfdh.permute(0, 2, 3, 1), dfdw.permute(0, 2, 3, 1), lap.permute(0, 2, 3, 1)
+
+
 def compute_physics_loss(pred, xb, yb, cfg, residual_mode: bool = False):
     """
     Compute Advection-Diffusion residual for PINO:
@@ -147,14 +202,16 @@ def compute_physics_loss(pred, xb, yb, cfg, residual_mode: bool = False):
         last_obs = xb[:, 0, t_in_cpm - 1, :, :].unsqueeze(-1)  # (B, H, W, 1)
         pred = last_obs + pred  # convert to absolute normalized space
 
-    # Temporal derivative against last observed cpm25 (channel 0 at last input step)
+    # Temporal derivative against last observed cpm25 (channel 0 at last observed step)
     dt = 1.0
-    last_c = xb[:, 0, -1, :, :].unsqueeze(-1)  # (B, H, W, 1)
+    t_in_cpm = cfg['time']['t_in_cpm']
+    last_c = xb[:, 0, t_in_cpm - 1, :, :].unsqueeze(-1)  # (B, H, W, 1)
     dC_dt = (pred - last_c) / dt               # (B, H, W, T)
 
-    # Spatial gradients on H and W axes
-    grad_h = torch.gradient(pred, dim=1)[0]
-    grad_w = torch.gradient(pred, dim=2)[0]
+    # Spatial derivatives in Fourier domain: exact and lower-noise than finite diff.
+    dx = cfg.get('physics', {}).get('dx', 1.0)
+    dy = cfg.get('physics', {}).get('dy', 1.0)
+    grad_h, grad_w, laplacian = _spectral_spatial_derivatives(pred, dx=dx, dy=dy)
 
     # 'features.all' does not exist in config — use 'features.base' which is the
     # actual list of base feature names used at training time.
@@ -177,9 +234,8 @@ def compute_physics_loss(pred, xb, yb, cfg, residual_mode: bool = False):
         v = xb[:, v_idx, -1, :, :].unsqueeze(-1)
         advection = u * grad_h + v * grad_w
 
-    # Diffusion (Laplacian on spatial axes)
+    # Diffusion (spectral Laplacian)
     kappa = cfg.get('physics', {}).get('diffusivity', 1.0)
-    laplacian = torch.gradient(grad_h, dim=1)[0] + torch.gradient(grad_w, dim=2)[0]
     diffusion = kappa * laplacian
 
     # Optional source term from available emission-like channels
@@ -248,13 +304,22 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
     t_in_cpm  = cfg['time']['t_in_cpm']
     residual_mode = cfg['training'].get('residual_target', False)
 
+    # Physics-Informed Fine-Tuning (PFT) schedule
+    use_pft = bool(cfg['training'].get('use_pft', True))
+    pft_ratio = float(cfg['training'].get('pft_phase1_ratio', 0.7))
+    pft_ratio = min(max(pft_ratio, 0.05), 0.95)
+    phase1_epochs = max(1, int(round(epochs * pft_ratio))) if use_pft else epochs
+    phase2_start_epoch = phase1_epochs
+    phase2_epochs = max(0, epochs - phase1_epochs)
+    pft_lr = float(cfg['training'].get('pft_lr', cfg['training']['lr'] * 0.35))
+
     # cpm25 range for physical RMSE estimation
     cpm_range = None
     if bounds is not None and 'cpm25' in bounds:
         fmin, fmax = bounds['cpm25']
         cpm_range  = fmax - fmin   # 1464.25 µg/m³
 
-    optimizer, scheduler = get_optimizer(cfg, model, len(train_dl))
+    optimizer, scheduler = get_optimizer(cfg, model, len(train_dl), epochs_override=max(1, phase1_epochs))
 
     best_val_loss  = float('inf')
     patience_count = 0
@@ -265,6 +330,11 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
     print(f"  Persistence gate  (normalized RMSE): {PERSISTENCE_RMSE_NORM:.4f}")
     if residual_mode:
         print("  Residual-target mode ON (Topic 8): model predicts delta from last obs")
+    if use_pft:
+        print(
+            f"  PFT enabled: phase-1 data-only epochs=1..{phase1_epochs}, "
+            f"phase-2 spectral-physics epochs={phase1_epochs+1}..{epochs}"
+        )
     if spatial_weight_map is not None:
         print("  Training loss uses hotspot-weighted spatial RMSE (val remains unweighted)")
     if cpm_range:
@@ -272,6 +342,30 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
     print(f"{'─'*60}\n")
 
     for epoch in range(epochs):
+        in_phase2 = use_pft and (epoch >= phase2_start_epoch)
+
+        if use_pft and epoch == phase2_start_epoch:
+            print(
+                f"\n→ Entering PFT phase-2 at epoch {epoch+1}: "
+                "freezing non-spectral weights, optimizing PDE residual only."
+            )
+            if hasattr(model, 'freeze_non_spectral'):
+                model.freeze_non_spectral()
+            else:
+                for name, p in model.named_parameters():
+                    keep = ('spectral' in name) or ('weight_pos' in name) or ('weight_neg' in name)
+                    p.requires_grad = bool(keep)
+
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            optimizer, scheduler = get_optimizer(
+                cfg,
+                model,
+                len(train_dl),
+                params=trainable_params,
+                epochs_override=max(1, phase2_epochs),
+                lr_override=pft_lr,
+            )
+
         # ── Train ──
         model.train()
         epoch_losses = []
@@ -303,7 +397,15 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
                 rmse_metric = rmse_loss_plain(pred, yb)
 
             physics_loss = compute_physics_loss(pred, xb, yb, cfg, residual_mode=residual_mode)
-            loss = lambda_d * data_loss + lambda_p * physics_loss
+            if in_phase2:
+                # Phase 2: spectral-only physics fine-tune (decoupled from data loss)
+                loss = physics_loss
+            elif use_pft:
+                # Phase 1: data-only training (no physics gradient conflict)
+                loss = data_loss
+            else:
+                # Backward-compatible joint objective when PFT disabled
+                loss = lambda_d * data_loss + lambda_p * physics_loss
             # Skip batch if loss is NaN/Inf (bad inputs slipping through)
             if not torch.isfinite(loss):
                 optimizer.zero_grad()
@@ -366,6 +468,9 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
             f"ValPersist: {persist_loss:.4f} | "
             f"Best: {best_val_loss:.4f}{tag}"
         )
+        if use_pft:
+            phase_tag = 'P2-physics-only' if in_phase2 else 'P1-data-only'
+            print(f"           phase={phase_tag}")
         if physics_warmup_epochs > 0:
             print(f"           lambda_p_eff={lambda_p:.4f} (target={lambda_p_target:.4f})")
 
