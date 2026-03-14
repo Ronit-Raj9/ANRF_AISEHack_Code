@@ -9,6 +9,7 @@ Training loop with:
 import os
 import numpy as np
 import torch
+from .data import get_hotspot_maps
 
 # Persistence RMSE baseline in normalized [0,1] cpm25 space (from EDA, t+16 avg)
 PERSISTENCE_RMSE_NORM = 0.0208
@@ -27,7 +28,12 @@ def _horizon_weights(cfg, target: torch.Tensor) -> torch.Tensor:
     return torch.linspace(lo, hi, t_out, device=target.device, dtype=target.dtype)
 
 
-def rmse_loss(pred: torch.Tensor, target: torch.Tensor, cfg: dict | None = None) -> torch.Tensor:
+def rmse_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    cfg: dict | None = None,
+    spatial_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
     """
     Spatial RMSE averaged over batch and time steps.
 
@@ -35,7 +41,10 @@ def rmse_loss(pred: torch.Tensor, target: torch.Tensor, cfg: dict | None = None)
     ----------
     pred, target : (B, H, W, T)  — values in normalized [0, 1] space
     """
-    spatial_mse = torch.mean((pred - target) ** 2, dim=(1, 2))  # (B, T)
+    sq_err = (pred - target) ** 2
+    if spatial_weights is not None:
+        sq_err = sq_err * spatial_weights[None, :, :, None]
+    spatial_mse = torch.mean(sq_err, dim=(1, 2))  # (B, T)
     if cfg is not None:
         weights = _horizon_weights(cfg, target)[None]
         spatial_mse = spatial_mse * weights
@@ -57,13 +66,31 @@ def mae_loss(pred: torch.Tensor, target: torch.Tensor, cfg: dict | None = None) 
     return torch.mean(spatial_mae)
 
 
-def objective_loss(pred: torch.Tensor, target: torch.Tensor, cfg: dict) -> torch.Tensor:
+def objective_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    cfg: dict,
+    spatial_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Main optimization objective: weighted RMSE + light MAE regularization."""
-    wrmse = rmse_loss(pred, target, cfg)
+    wrmse = rmse_loss(pred, target, cfg, spatial_weights=spatial_weights)
     wmae = mae_loss(pred, target, cfg)
     a = cfg.get('loss', {}).get('rmse_weight', 0.8)
     b = cfg.get('loss', {}).get('mae_weight', 0.2)
     return a * wrmse + b * wmae
+
+
+def get_spatial_weight_tensor(cfg: dict, device: torch.device, dtype: torch.dtype) -> torch.Tensor | None:
+    """Return hotspot-based spatial weight tensor (H, W) or None if disabled."""
+    if not cfg.get('loss', {}).get('use_spatial_hotspot_weight', True):
+        return None
+
+    cached = cfg.get('_hotspot_weight_map', None)
+    if cached is None:
+        _, weight_map = get_hotspot_maps(cfg)
+        cfg['_hotspot_weight_map'] = weight_map
+        cached = weight_map
+    return torch.as_tensor(cached, device=device, dtype=dtype)
 
 
 # ─────────────────────────────────────────────
@@ -220,9 +247,12 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
     best_val_loss  = float('inf')
     patience_count = 0
     history        = {'train_loss': [], 'val_loss': [], 'train_objective': [], 'val_persistence': []}
+    spatial_weight_map = get_spatial_weight_tensor(cfg, device, torch.float32)
 
     print(f"\n{'─'*60}")
     print(f"  Persistence gate  (normalized RMSE): {PERSISTENCE_RMSE_NORM:.4f}")
+    if spatial_weight_map is not None:
+        print("  Training loss uses hotspot-weighted spatial RMSE (val remains unweighted)")
     if cpm_range:
         print(f"  Persistence gate  (physical RMSE) : {PERSISTENCE_RMSE_PHYS:.2f} µg/m³")
     print(f"{'─'*60}\n")
@@ -235,7 +265,8 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
         for xb, yb in train_dl:
             xb, yb = xb.to(device), yb.to(device)
             pred   = model(xb)
-            data_loss = objective_loss(pred, yb, cfg)
+            sw = spatial_weight_map.to(pred.dtype) if spatial_weight_map is not None else None
+            data_loss = objective_loss(pred, yb, cfg, spatial_weights=sw)
             physics_loss = compute_physics_loss(pred, xb, yb, cfg)
             lambda_d = cfg['training'].get('lambda_d', 1.0)
             lambda_p = cfg['training'].get('lambda_p', 0.1)

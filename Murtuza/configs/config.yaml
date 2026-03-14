@@ -33,6 +33,7 @@ data:
   val_split:   0.15
   test_samples: 996
   december_grid_sigma_norm: true
+  use_hotspot_climatology_channel: true
 
 # ── Persistence baseline (from EDA) — values in *normalized* [0,1] space ──
 persistence:
@@ -83,6 +84,7 @@ training:
   lambda_p: 0.1
 
 loss:
+  use_spatial_hotspot_weight: true
   horizon_weight_min: 0.8
   horizon_weight_max: 1.4
   rmse_weight: 0.8

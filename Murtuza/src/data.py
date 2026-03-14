@@ -58,11 +58,11 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, TensorDataset
 
-def add_physical_features(tensor, features_dict=None, lat_long_path='lat_long.npy'):
+def add_physical_features(tensor, features_dict=None, lat_long_path='lat_long.npy', cfg=None):
     """
-    Add 12 engineered physics channels for PINO in a memory-efficient way:
+        Add engineered physics channels for PINO in a memory-efficient way:
       wind_speed, wind_dir, RH, hour_sin, hour_cos, month_sin, month_cos,
-      lat, lon, lag_1, lag_3, lag_6
+            hotspot_clim, lag_1, lag_3, lag_6
 
     Memory strategy: pre-allocate a single float32 output array and fill each
     engineered channel one at a time (rather than materialising a large stack).
@@ -74,9 +74,9 @@ def add_physical_features(tensor, features_dict=None, lat_long_path='lat_long.np
     # ── Normalise dtype to float32 immediately ───────────────────────────────
     tensor = np.asarray(tensor, dtype=np.float32)
     N, C, T, H, W = tensor.shape
-    N_ENG = 12
+    N_ENG = 11
 
-    # Pre-allocate output: (N, C+12, T, H, W) float32
+    # Pre-allocate output: (N, C+N_ENG, T, H, W) float32
     out = np.empty((N, C + N_ENG, T, H, W), dtype=np.float32)
     out[:, :C] = tensor          # copy base channels (no extra alloc beyond out)
     ch = C                       # next free channel index
@@ -121,16 +121,17 @@ def add_physical_features(tensor, features_dict=None, lat_long_path='lat_long.np
     del hour
     gc.collect()
 
-    # ── Static lat / lon ────────────────────────────────────────────────────
-    ll = np.load(lat_long_path).astype(np.float32)
-    lat = ll[:, :, 0];  lon = ll[:, :, 1]
-    lat = (lat - lat.min()) / (lat.max() - lat.min() + np.float32(1e-8))
-    lon = (lon - lon.min()) / (lon.max() - lon.min() + np.float32(1e-8))
-    out[:, ch] = lat.reshape(1, 1, H, W)   # (1,1,H,W) broadcasts to (N,T,H,W)
+    # ── Static hotspot climatology prior ────────────────────────────────────
+    if cfg is not None and cfg.get('data', {}).get('use_hotspot_climatology_channel', True):
+        prior_map, _ = get_hotspot_maps(cfg)
+    else:
+        # fallback: derive prior from already-loaded cpm25 channel
+        cpm = tensor[:, features_dict['cpm25'], :, :, :]
+        prior_map = np.log1p(np.clip(np.mean(cpm, axis=(0, 1)), 0.0, None)).astype(np.float32)
+        prior_map = (prior_map - prior_map.mean()) / (prior_map.std() + np.float32(1e-6))
+    out[:, ch] = prior_map.reshape(1, 1, H, W)
     ch += 1
-    out[:, ch] = lon.reshape(1, 1, H, W)
-    ch += 1
-    del ll, lat, lon
+    del prior_map
     gc.collect()
 
     # ── PM2.5 lags ───────────────────────────────────────────────────────────
@@ -253,6 +254,56 @@ MASK_ONLY_FEATURES = {'NMVOC_finn'}
 LOG_EPS = np.float32(1e-12)
 DEC_STD_EPS = np.float32(1e-6)
 _DECEMBER_STATS_CACHE: dict[tuple[str, str], tuple[np.ndarray, np.ndarray]] = {}
+_HOTSPOT_MAP_CACHE: dict[tuple[str, tuple[str, ...], int], tuple[np.ndarray, np.ndarray]] = {}
+
+
+def get_hotspot_maps(cfg: dict) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build hotspot climatology prior and spatial loss-weight map from raw cpm25.
+
+    Returns
+    -------
+    prior_z : (H, W) float32
+        log1p(climatology) standardized to zero mean / unit std.
+    weights : (H, W) float32
+        log1p(climatology) normalized so global mean weight = 1.0.
+    """
+    data_dir = cfg['paths']['data']
+    months = tuple(cfg.get('data', {}).get('train_months', cfg['data']['months']))
+    t_in_cpm = int(cfg.get('time', {}).get('t_in_cpm', 10))
+    cache_key = (data_dir, months, t_in_cpm)
+    if cache_key in _HOTSPOT_MAP_CACHE:
+        return _HOTSPOT_MAP_CACHE[cache_key]
+
+    sum_map = None
+    count = 0
+    for month in months:
+        cpm_path = os.path.join(data_dir, 'raw', month, 'cpm25.npy')
+        if not os.path.exists(cpm_path):
+            raise FileNotFoundError(f"Missing cpm25 file for hotspot climatology: {cpm_path}")
+        arr = np.load(cpm_path).astype(np.float32)  # (T,H,W)
+        if arr.ndim != 3:
+            raise ValueError(f"Unexpected cpm25 shape in {cpm_path}: {arr.shape}")
+        month_sum = np.sum(arr, axis=0)
+        if sum_map is None:
+            sum_map = month_sum
+        else:
+            sum_map += month_sum
+        count += arr.shape[0]
+
+    if sum_map is None or count <= 0:
+        raise RuntimeError("Failed to build hotspot climatology map (empty training cpm25).")
+
+    clim_raw = (sum_map / np.float32(count)).astype(np.float32)
+    clim_log = np.log1p(np.clip(clim_raw, 0.0, None)).astype(np.float32)
+
+    prior_mean = float(np.mean(clim_log))
+    prior_std = float(np.std(clim_log))
+    prior_z = ((clim_log - np.float32(prior_mean)) / np.float32(prior_std + 1e-6)).astype(np.float32)
+
+    weights = (clim_log / np.float32(np.mean(clim_log) + 1e-6)).astype(np.float32)
+    _HOTSPOT_MAP_CACHE[cache_key] = (prior_z, weights)
+    return prior_z, weights
 
 
 def _transform_feature_values(arr: np.ndarray, feat: str) -> np.ndarray:
