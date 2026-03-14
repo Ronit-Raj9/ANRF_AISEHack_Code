@@ -45,18 +45,18 @@ model:
   # U-Net settings
   base_ch: 64
   # TFNO2D settings (fallback)
-  width:   48
-  modes:   16
-  depth:   4
+  width:   72
+  modes:   20
+  depth:   6
   # Residual spatiotemporal U-Net settings
   stem_ch: 48
   dropout: 0.1
 
 models:
   tfno2d:
-    width: 48
-    modes: 16
-    depth: 4
+    width: 72
+    modes: 20
+    depth: 6
   unet:
     base_ch: 64
   res_stunet:
@@ -65,23 +65,24 @@ models:
     dropout: 0.1
 
 training:
-  epochs:           30
-  patience:         12         # early-stopping epochs without val improvement
-  batch_size_train: 4
-  batch_size_val:   8
+  epochs:           80
+  patience:         20         # larger model needs longer runway
+  batch_size_train: 2
+  batch_size_val:   4
   batch_size_test:  16
-  lr:               6.0e-4
-  weight_decay:     1.0e-3
-  pct_start:        0.1        # OneCycleLR warmup fraction (unused by coswr)
-  scheduler:        "coswr"    # cosine warm restarts; use "onecycle" to revert
+  lr:               1.2e-3
+  weight_decay:     1.0e-4
+  pct_start:        0.2        # OneCycleLR warmup fraction
+  scheduler:        "onecycle"
   t0_epochs:        20         # CosWR: smoother first cycle for fewer restart spikes
   t_mult:           1          # keep cycle length fixed for steadier late training
-  grad_clip:        1.0
+  grad_clip:        0.8
   num_workers:      2
   pin_memory:       true
   seed:             42
   lambda_d: 1.0
-  lambda_p: 0.05
+  lambda_p: 0.02
+  physics_warmup_epochs: 25
 
 loss:
   use_spatial_hotspot_weight: true

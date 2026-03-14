@@ -264,14 +264,21 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
         model.train()
         epoch_losses = []
         epoch_rmse = []
+        lambda_d = cfg['training'].get('lambda_d', 1.0)
+        lambda_p_target = cfg['training'].get('lambda_p', 0.1)
+        physics_warmup_epochs = max(0, int(cfg['training'].get('physics_warmup_epochs', 0)))
+        if physics_warmup_epochs > 0:
+            warmup_scale = min(1.0, float(epoch + 1) / float(physics_warmup_epochs))
+            lambda_p = lambda_p_target * warmup_scale
+        else:
+            lambda_p = lambda_p_target
+
         for xb, yb in train_dl:
             xb, yb = xb.to(device), yb.to(device)
             pred   = model(xb)
             sw = spatial_weight_map.to(pred.dtype) if spatial_weight_map is not None else None
             data_loss = objective_loss(pred, yb, cfg, spatial_weights=sw)
             physics_loss = compute_physics_loss(pred, xb, yb, cfg)
-            lambda_d = cfg['training'].get('lambda_d', 1.0)
-            lambda_p = cfg['training'].get('lambda_p', 0.1)
             loss = lambda_d * data_loss + lambda_p * physics_loss
             # Skip batch if loss is NaN/Inf (bad inputs slipping through)
             if not torch.isfinite(loss):
@@ -331,6 +338,8 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
             f"ValPersist: {persist_loss:.4f} | "
             f"Best: {best_val_loss:.4f}{tag}"
         )
+        if physics_warmup_epochs > 0:
+            print(f"           lambda_p_eff={lambda_p:.4f} (target={lambda_p_target:.4f})")
 
         # Persistence gate check every 5 epochs
         if (epoch + 1) % 5 == 0:
