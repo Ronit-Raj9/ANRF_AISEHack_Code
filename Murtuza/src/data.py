@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import Dataset, DataLoader, TensorDataset, random_split
+from torch.utils.data import Dataset, DataLoader, TensorDataset, Subset
 
 # Sliding window dataset for time series
 class SlidingWindowTensorDataset(Dataset):
@@ -601,24 +601,53 @@ def make_dataloaders(cfg, tensor, bounds):
     t_out = cfg['time']['t_out']
     val_split = cfg['data'].get('val_split', 0.1)
 
-    # Build windows from the full tensor first, then split window indices.
-    # This uses all available months/data instead of dropping entire months
-    # based on a month-level split.
+    # Build windows from the full tensor first.
     # t_in_cpm: masks future cpm25 hours (t_in_cpm:window_size) to zeros so
     # training matches test-time conditions (only 10 observed hours available).
     t_in_cpm = cfg['time'].get('t_in_cpm', 10)
     full_ds = SlidingWindowTensorDataset(
         tensor, window_size, t_out=t_out, target_channel=0, t_in_cpm=t_in_cpm
     )
-    n_total = len(full_ds)
-    n_val   = max(1, int(n_total * val_split))
-    n_train = n_total - n_val
-    if n_train <= 0:
-        raise ValueError(f"Invalid val_split={val_split}; not enough windows for training.")
 
-    seed = cfg.get('training', {}).get('seed', 42)
-    generator = torch.Generator().manual_seed(seed)
-    train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=generator)
+    # ── Temporal firewall split (no random leakage) ─────────────────────────
+    # Use the LAST val_split windows of each month for validation, and exclude
+    # train windows within ±firewall_hours from the train/val boundary.
+    # This avoids adjacent-window leakage that can produce unrealistically low
+    # validation RMSE.
+    firewall_hours = int(cfg.get('data', {}).get('val_firewall_hours', 12))
+    n_months = full_ds.N
+    windows_per_month = full_ds.num_windows
+
+    train_indices = []
+    val_indices = []
+
+    for month_idx in range(n_months):
+        n_val_m = max(1, int(windows_per_month * val_split))
+        val_start = windows_per_month - n_val_m
+
+        # Validation block: tail windows in this month.
+        for w in range(val_start, windows_per_month):
+            val_indices.append(month_idx * windows_per_month + w)
+
+        # Training block: strictly before firewall boundary.
+        train_end = max(0, val_start - firewall_hours)
+        for w in range(0, train_end):
+            train_indices.append(month_idx * windows_per_month + w)
+
+    if len(train_indices) == 0 or len(val_indices) == 0:
+        raise ValueError(
+            "Temporal firewall split produced empty train/val set. "
+            "Reduce val_split or val_firewall_hours."
+        )
+
+    train_ds = Subset(full_ds, train_indices)
+    val_ds = Subset(full_ds, val_indices)
+
+    print(
+        f"Temporal split enabled: windows/month={windows_per_month}, "
+        f"val_split={val_split:.2f}, firewall={firewall_hours}h | "
+        f"train={len(train_ds):,}, val={len(val_ds):,}"
+    )
 
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_dl = DataLoader(val_ds, batch_size=val_batch_size, shuffle=False)

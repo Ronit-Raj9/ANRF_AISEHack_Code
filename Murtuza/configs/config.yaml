@@ -31,6 +31,7 @@ data:
   months:      ["APRIL_16", "JULY_16", "OCT_16", "DEC_16"]
   val_month:   "OCT_16"
   val_split:   0.15
+  val_firewall_hours: 12
   test_samples: 996
   december_grid_sigma_norm: true
   use_hotspot_climatology_channel: true
