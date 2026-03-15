@@ -43,7 +43,7 @@ class SlidingWindowTensorDataset(Dataset):
 Data loading, normalization, sample construction, and PyTorch Dataset.
  
 Design notes:
-- Normalization: official min-max from feat_min_max.mat → clip to [0, 1].
+- Normalization: official min-max from feat_min_max.mat -> clip to [0, 1].
     This ensures train/test consistency and makes the persistence RMSE gate
     directly interpretable (threshold = 0.0208 in normalized space).
 - Preprocessing: append static geography (`lat`, `lon`) and calendar signals
@@ -65,7 +65,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, TensorDataset
 
-# ── Month name → integer (1-12) helper for month encoding ──────────────────
+# -- Month name -> integer (1-12) helper for month encoding ------------------
 _MONTH_NAME_TO_NUM = {
     'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'APRIL': 4,
     'MAY': 5, 'JUN': 6, 'JUNE': 6, 'JUL': 7, 'JULY': 7,
@@ -161,7 +161,7 @@ def add_physical_features(tensor, features_dict=None, lat_long_path='lat_long.np
         out[:, ch] = vals.reshape(1, T, 1, 1)
         ch += 1
 
-    # ── Month encoding — per-month if months list provided, else constant ────
+    # -- Month encoding - per-month if months list provided, else constant ----
     # The constant placeholder (sin(2π/12)) was the same scalar for every month
     # in the batch, making the channels completely uninformative.  With the
     # months list we compute the correct calendar-month encoding per sample.
@@ -342,7 +342,7 @@ def compute_pixel_stats(cfg: dict, months: list, bounds: dict) -> dict:
     for month in months:
         print(f"  Computing pixel stats for {month} ...", end=" ", flush=True)
         for feat in features:
-            # Skip binary indicators — they are kept as 0/1 and don't need pixel z-score
+            # Skip binary indicators - they are kept as 0/1 and don't need pixel z-score
             if feat in MASK_ONLY_FEATURES or feat == 'rain_mask' or feat.endswith('_mask'):
                 continue
             path = os.path.join(data_dir, 'raw', month, f'{feat}.npy')
@@ -397,7 +397,7 @@ def save_pixel_stats(pixel_stats: dict, path: str) -> None:
         else:
             flat[feat] = d
     np.savez(path, **flat)
-    print(f"Pixel stats saved → {path}")
+    print(f"Pixel stats saved -> {path}")
 
 
 def load_pixel_stats(path: str) -> dict:
@@ -586,7 +586,7 @@ def preprocess_feature(arr: np.ndarray, feat: str, bounds: dict, month: str | No
 
     # NOTE: PBLH previously used per-month local min-max when month was given,
     # but global bounds at test time (month=None).  This created a train/test
-    # distribution mismatch — PBLH summer peaks could clip completely differently.
+    # distribution mismatch - PBLH summer peaks could clip completely differently.
     # Fix: always use the global official bounds from feat_min_max.mat.
 
     fmin, fmax = _transform_bounds(*bounds[feat], feat)
@@ -789,7 +789,7 @@ def load_all_months(cfg, months: list, bounds: dict, pixel_stats: dict | None = 
 
 
 # ─────────────────────────────────────────────
-# PyTorch Dataset — Lazy Sliding Windows
+# PyTorch Dataset - Lazy Sliding Windows
 
 def make_dataloaders(cfg, tensor, bounds):
     batch_size = cfg['training']['batch_size_train']
@@ -856,10 +856,10 @@ class PM25Dataset(Dataset):
     Lazy sliding-window PM2.5 dataset.
 
     Window logic (per EDA):
-    - Input  : met/emis[t : t+T_IN_MET]  — 26 hrs (10 past + 16 NWP forecast)
-               cpm25  [t : t+T_IN_CPM]   — 10 hrs known; hours 10-25 → 0.0
+    - Input  : met/emis[t : t+T_IN_MET]  - 26 hrs (10 past + 16 NWP forecast)
+               cpm25  [t : t+T_IN_CPM]   - 10 hrs known; hours 10-25 -> 0.0
     - Target : cpm25  [t+T_IN_CPM :
-                       t+T_IN_CPM+T_OUT]  — next 16 hrs (normalized)
+                       t+T_IN_CPM+T_OUT]  - next 16 hrs (normalized)
     Both input and target are in normalized [0, 1] space.
 
     Output shapes
@@ -911,7 +911,7 @@ class PM25Dataset(Dataset):
             channels.append(chunk)
         x = torch.from_numpy(np.stack(channels, axis=0))  # (C, T, H, W)
 
-        # ── Target (H, W, T_out) — normalized cpm25 ──
+        # -- Target (H, W, T_out) - normalized cpm25 --
         y_arr = mdata['cpm25'][t + t_cpm : t + t_cpm + t_out]  # (T_out, H, W)
         y = torch.from_numpy(y_arr).permute(1, 2, 0)            # (H, W, T_out)
 
@@ -1007,7 +1007,7 @@ def build_test_input(cfg, bounds: dict, start: int = 0, end: int | None = None,
             if use_pixel_norm:
                 cpm_proc = preprocess_feature_pixelwise(arr, feat, pixel_stats)
             else:
-                # Standard min-max log1p normalization — matches SlidingWindowTensorDataset
+                # Standard min-max log1p normalization - matches SlidingWindowTensorDataset
                 cpm_proc = preprocess_feature(arr, feat, bounds, month=None)
             # Fill unknown future cpm25 hours (t_in_cpm:) with ZEROS.
             n_fill  = t_in_met - t_in_cpm
