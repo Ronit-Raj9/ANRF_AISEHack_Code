@@ -42,18 +42,18 @@ model:
   # U-Net settings
   base_ch: 64
   # TFNO2D settings (fallback)
-  width:   48
-  modes:   16
-  depth:   4
+  width:   64
+  modes:   18
+  depth:   5
   # Residual spatiotemporal U-Net settings
   stem_ch: 48
   dropout: 0.1
 
 models:
   tfno2d:
-    width: 32
-    modes: 12
-    depth: 3
+    width: 64
+    modes: 18
+    depth: 5
   unet:
     base_ch: 64
   res_stunet:
@@ -64,8 +64,8 @@ models:
 training:
   epochs:           80
   patience:         12         # early-stopping epochs without val improvement
-  batch_size_train: 4
-  batch_size_val:   8
+  batch_size_train: 2
+  batch_size_val:   4
   batch_size_test:  16
   lr:               3.0e-4
   weight_decay:     1.0e-4
@@ -74,6 +74,8 @@ training:
   t0_epochs:        10         # CosWR: restart period in epochs
   t_mult:           2          # CosWR: period doubling factor (10→20→40 epochs)
   grad_clip:        0.5
+  use_amp:          true
+  accum_steps:      2
   num_workers:      2
   pin_memory:       true
   seed:             42

@@ -9,6 +9,7 @@ Training loop with:
 import os
 import numpy as np
 import torch
+from torch.cuda.amp import GradScaler, autocast
 
 # Persistence RMSE baseline in normalized [0,1] cpm25 space (from EDA, t+16 avg)
 PERSISTENCE_RMSE_NORM = 0.0208
@@ -208,6 +209,9 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
     grad_clip = cfg['training']['grad_clip']
     save_path = cfg['paths']['model_save']
     t_in_cpm  = cfg['time']['t_in_cpm']
+    use_amp   = bool(cfg['training'].get('use_amp', True)) and str(device).startswith('cuda')
+    accum_steps = max(1, int(cfg['training'].get('accum_steps', 1)))
+    scaler = GradScaler(enabled=use_amp)
 
     # cpm25 range for physical RMSE estimation
     cpm_range = None
@@ -232,27 +236,45 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
         model.train()
         epoch_losses = []
         epoch_rmse = []
+        optimizer.zero_grad(set_to_none=True)
         for xb, yb in train_dl:
-            xb, yb = xb.to(device), yb.to(device)
-            pred   = model(xb)
-            data_loss = objective_loss(pred, yb, cfg)
-            physics_loss = compute_physics_loss(pred, xb, yb, cfg)
-            lambda_d = cfg['training'].get('lambda_d', 1.0)
-            lambda_p = cfg['training'].get('lambda_p', 0.1)
-            loss = lambda_d * data_loss + lambda_p * physics_loss
+            xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+            with autocast(enabled=use_amp):
+                pred   = model(xb)
+                data_loss = objective_loss(pred, yb, cfg)
+                physics_loss = compute_physics_loss(pred, xb, yb, cfg)
+                lambda_d = cfg['training'].get('lambda_d', 1.0)
+                lambda_p = cfg['training'].get('lambda_p', 0.1)
+                loss = lambda_d * data_loss + lambda_p * physics_loss
             # Skip batch if loss is NaN/Inf (bad inputs slipping through)
             if not torch.isfinite(loss):
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 continue
             rmse_metric = rmse_loss_plain(pred, yb)
 
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
-            scheduler.step()
+            scaled_loss = loss / accum_steps
+            scaler.scale(scaled_loss).backward()
+
+            do_step = (len(epoch_losses) + 1) % accum_steps == 0
+            if do_step:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
+
             epoch_losses.append(loss.item())
             epoch_rmse.append(rmse_metric.item())
+
+        # Flush leftover gradients when batch count is not divisible by accum_steps
+        if len(epoch_losses) > 0 and (len(epoch_losses) % accum_steps != 0):
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
 
         # ── Validate ──
         model.eval()
@@ -260,8 +282,9 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
         val_persist = []
         with torch.no_grad():
             for xb, yb in val_dl:
-                xb, yb = xb.to(device), yb.to(device)
-                pred   = model(xb)
+                xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+                with autocast(enabled=use_amp):
+                    pred = model(xb)
                 val_losses.append(rmse_loss_plain(pred, yb).item())
                 val_persist.append(persistence_rmse_from_batch(xb, yb, t_in_cpm).item())
 
