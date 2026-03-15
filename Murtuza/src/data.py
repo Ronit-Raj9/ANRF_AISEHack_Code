@@ -372,7 +372,7 @@ def compute_pixel_stats(cfg: dict, months: list, bounds: dict) -> dict:
     pixel_stats: dict = {}
     N = float(count)
     for feat in features:
-        if feat == 'rain_mask':
+        if feat in MASK_ONLY_FEATURES or feat == 'rain_mask' or feat.endswith('_mask'):
             continue
         mu       = (sum_map[feat] / N).astype(np.float32)
         variance = np.maximum(
