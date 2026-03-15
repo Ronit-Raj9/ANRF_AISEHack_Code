@@ -212,7 +212,9 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
     use_amp   = bool(cfg['training'].get('use_amp', True)) and str(device).startswith('cuda')
     amp_device = 'cuda' if str(device).startswith('cuda') else 'cpu'
     accum_steps = max(1, int(cfg['training'].get('accum_steps', 1)))
-    scaler = GradScaler(amp_device, enabled=use_amp)
+    has_complex_params = any(p.is_complex() for p in model.parameters())
+    use_scaler = use_amp and not has_complex_params
+    scaler = GradScaler(amp_device, enabled=use_scaler)
 
     # cpm25 range for physical RMSE estimation
     cpm_range = None
@@ -230,6 +232,8 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
     print(f"  Persistence gate  (normalized RMSE): {PERSISTENCE_RMSE_NORM:.4f}")
     if cpm_range:
         print(f"  Persistence gate  (physical RMSE) : {PERSISTENCE_RMSE_PHYS:.2f} µg/m³")
+    if use_amp and not use_scaler:
+        print("  AMP autocast enabled without GradScaler (complex spectral params detected)")
     print(f"{'─'*60}\n")
 
     for epoch in range(epochs):
@@ -254,14 +258,21 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
             rmse_metric = rmse_loss_plain(pred, yb)
 
             scaled_loss = loss / accum_steps
-            scaler.scale(scaled_loss).backward()
+            if use_scaler:
+                scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
 
             do_step = (len(epoch_losses) + 1) % accum_steps == 0
             if do_step:
-                scaler.unscale_(optimizer)
+                if use_scaler:
+                    scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
+                if use_scaler:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
 
@@ -270,10 +281,14 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
 
         # Flush leftover gradients when batch count is not divisible by accum_steps
         if len(epoch_losses) > 0 and (len(epoch_losses) % accum_steps != 0):
-            scaler.unscale_(optimizer)
+            if use_scaler:
+                scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
+            if use_scaler:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
 
