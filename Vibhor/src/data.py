@@ -93,15 +93,23 @@ def add_physical_features(tensor, features_dict=None, lat_long_path='lat_long.np
     del u10, v10
     gc.collect()
 
-    # ── Relative humidity ────────────────────────────────────────────────────
+    # ── Relative humidity (numerically stable) ──────────────────────────────
     t2 = tensor[:, features_dict['t2'], :, :, :].copy().astype(np.float32)
     q2 = tensor[:, features_dict['q2'], :, :, :].copy().astype(np.float32)
-    denom_safe = np.where(np.abs(t2 - 29.65) < 1e-3,
-                          np.sign(t2 - 29.65 + np.float32(1e-3)) * np.float32(1e-3),
-                          t2 - np.float32(29.65)).astype(np.float32)
-    exponent = np.clip(np.float32(17.67) * (t2 - np.float32(273.15)) / denom_safe,
-                       np.float32(-100.0), np.float32(100.0))
-    rh = q2 / (np.float32(0.622) + np.float32(0.378) * q2 + np.float32(1e-8)) * np.exp(exponent)
+    np.nan_to_num(t2, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    np.nan_to_num(q2, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+    denom = t2 - np.float32(29.65)
+    denom_safe = np.where(np.abs(denom) < np.float32(1e-3), np.float32(1e-3), denom).astype(np.float32)
+    exponent = (np.float32(17.67) * (t2 - np.float32(273.15)) / denom_safe).astype(np.float32)
+
+    # Compute exp in float64 with bounded argument to avoid float32 overflow.
+    # exp(60) is finite and large enough for this engineered feature.
+    exp_arg = np.clip(exponent.astype(np.float64), -60.0, 60.0)
+    vapor_term = np.exp(exp_arg)
+
+    mixing_ratio = (q2 / (np.float32(0.622) + np.float32(0.378) * q2 + np.float32(1e-8))).astype(np.float64)
+    rh = (mixing_ratio * vapor_term).astype(np.float32)
     out[:, ch] = np.clip(rh, np.float32(0.0), np.float32(1.5))
     ch += 1
     del t2, q2, denom_safe, exponent, rh
