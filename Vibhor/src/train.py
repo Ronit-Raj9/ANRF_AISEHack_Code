@@ -9,7 +9,7 @@ Training loop with:
 import os
 import numpy as np
 import torch
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 
 # Persistence RMSE baseline in normalized [0,1] cpm25 space (from EDA, t+16 avg)
 PERSISTENCE_RMSE_NORM = 0.0208
@@ -210,8 +210,9 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
     save_path = cfg['paths']['model_save']
     t_in_cpm  = cfg['time']['t_in_cpm']
     use_amp   = bool(cfg['training'].get('use_amp', True)) and str(device).startswith('cuda')
+    amp_device = 'cuda' if str(device).startswith('cuda') else 'cpu'
     accum_steps = max(1, int(cfg['training'].get('accum_steps', 1)))
-    scaler = GradScaler(enabled=use_amp)
+    scaler = GradScaler(amp_device, enabled=use_amp)
 
     # cpm25 range for physical RMSE estimation
     cpm_range = None
@@ -239,7 +240,7 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
         optimizer.zero_grad(set_to_none=True)
         for xb, yb in train_dl:
             xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
-            with autocast(enabled=use_amp):
+            with autocast(amp_device, enabled=use_amp):
                 pred   = model(xb)
                 data_loss = objective_loss(pred, yb, cfg)
                 physics_loss = compute_physics_loss(pred, xb, yb, cfg)
@@ -283,7 +284,7 @@ def train(cfg, model, train_dl, val_dl, bounds: dict = None):
         with torch.no_grad():
             for xb, yb in val_dl:
                 xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
-                with autocast(enabled=use_amp):
+                with autocast(amp_device, enabled=use_amp):
                     pred = model(xb)
                 val_losses.append(rmse_loss_plain(pred, yb).item())
                 val_persist.append(persistence_rmse_from_batch(xb, yb, t_in_cpm).item())

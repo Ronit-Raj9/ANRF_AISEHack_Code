@@ -312,22 +312,26 @@ class _SpectralConv2d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
-        x_ft = torch.fft.rfft2(x, norm='ortho')
-        out_ft = torch.zeros(
-            B, self.weight_pos.shape[1], H, W // 2 + 1,
-            dtype=torch.cfloat, device=x.device,
-        )
-        out_ft[:, :, :self.modes1, :self.modes2] = torch.einsum(
-            'bixy,ioxy->boxy',
-            x_ft[:, :, :self.modes1, :self.modes2],
-            self.weight_pos,
-        )
-        out_ft[:, :, -self.modes1:, :self.modes2] = torch.einsum(
-            'bixy,ioxy->boxy',
-            x_ft[:, :, -self.modes1:, :self.modes2],
-            self.weight_neg,
-        )
-        return torch.fft.irfft2(out_ft, s=(H, W), norm='ortho')
+        out_dtype = x.dtype
+        with torch.amp.autocast(device_type=x.device.type, enabled=False):
+            x32 = x.float()
+            x_ft = torch.fft.rfft2(x32, norm='ortho')
+            out_ft = torch.zeros(
+                B, self.weight_pos.shape[1], H, W // 2 + 1,
+                dtype=torch.cfloat, device=x.device,
+            )
+            out_ft[:, :, :self.modes1, :self.modes2] = torch.einsum(
+                'bixy,ioxy->boxy',
+                x_ft[:, :, :self.modes1, :self.modes2],
+                self.weight_pos,
+            )
+            out_ft[:, :, -self.modes1:, :self.modes2] = torch.einsum(
+                'bixy,ioxy->boxy',
+                x_ft[:, :, -self.modes1:, :self.modes2],
+                self.weight_neg,
+            )
+            out = torch.fft.irfft2(out_ft, s=(H, W), norm='ortho')
+        return out.to(dtype=out_dtype)
 
 
 class _FNOBlock(nn.Module):
