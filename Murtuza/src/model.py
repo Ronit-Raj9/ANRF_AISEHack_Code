@@ -392,9 +392,13 @@ class TFNO2D(nn.Module):
     def __init__(self, in_channels: int, out_steps: int = 16,
                  width: int = 64, modes: int = 24, depth: int = 6,
                  padding_mode: str = 'circular',
-                 clamp_output: bool = True):
+                 clamp_output: bool = True,
+                 residual_output: bool = False,
+                 residual_scale: float = 0.3):
         super().__init__()
         self.clamp_output = clamp_output
+        self.residual_output = residual_output
+        self.residual_scale = float(residual_scale)
         # Padding sizes to bring 140→144 and 124→128 (multiples of 8 / power-of-2)
         self._pad = (2, 2, 2, 2)   # (left, right, top, bottom) for F.pad
         self.lift   = nn.Conv2d(in_channels, width, 1)
@@ -406,6 +410,12 @@ class TFNO2D(nn.Module):
             nn.Conv2d(width * 2, width * 2, 1), nn.GELU(),
             nn.Conv2d(width * 2, out_steps, 1),
         )
+
+        # Stable residual start: near-persistence at epoch 0
+        if self.residual_output:
+            nn.init.zeros_(self.proj[-1].weight)
+            if self.proj[-1].bias is not None:
+                nn.init.zeros_(self.proj[-1].bias)
 
     def freeze_non_spectral(self) -> None:
         """Freeze everything except spectral kernels for PFT phase-2."""
@@ -437,7 +447,10 @@ class TFNO2D(nn.Module):
         x = self.proj(torch.cat([global_feat, local_feat], dim=1))  # (B, T_out, H+4, W+4)
         # Crop back to original spatial dims
         x = x[:, :, 2:2+H, 2:2+W]                     # (B, T_out, H, W)
-        if self.clamp_output:
+        if self.residual_output:
+            # Bounded residual head to prevent large early-epoch deltas.
+            x = self.residual_scale * torch.tanh(x)
+        elif self.clamp_output:
             x = torch.clamp(x, 0.0, 1.0)
         return x.permute(0, 2, 3, 1)                   # (B, H, W, T_out)
 
@@ -496,6 +509,8 @@ def build_model(cfg) -> nn.Module:
             modes        = cfg['model']['modes'],
             depth        = cfg['model']['depth'],
             clamp_output = not residual_mode,
+            residual_output = residual_mode,
+            residual_scale = cfg.get('model', {}).get('residual_scale', 0.3),
         )
     elif mtype == 'res_stunet':
         model = MODEL_REGISTRY[mtype](

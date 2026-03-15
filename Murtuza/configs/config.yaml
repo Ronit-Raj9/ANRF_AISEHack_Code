@@ -55,6 +55,7 @@ model:
   # Residual spatiotemporal U-Net settings
   stem_ch: 48
   dropout: 0.1
+  residual_scale: 0.3
 
 models:
   tfno2d:
@@ -69,18 +70,18 @@ models:
     dropout: 0.1
 
 training:
-  epochs:           20
+  epochs:           80
   patience:         20         # larger model needs longer runway
   batch_size_train: 2
   batch_size_val:   4
   batch_size_test:  16
-  lr:               1.2e-3
+  lr:               2.5e-4
   weight_decay:     1.0e-4
   pct_start:        0.2        # OneCycleLR warmup fraction
-  scheduler:        "onecycle"
+  scheduler:        "coswr"
   t0_epochs:        20         # CosWR: smoother first cycle for fewer restart spikes
   t_mult:           1          # keep cycle length fixed for steadier late training
-  grad_clip:        0.8
+  grad_clip:        0.3
   residual_target:  true       # Topic 8: model predicts delta from last observed cpm25
   num_workers:      2
   pin_memory:       true
@@ -90,7 +91,7 @@ training:
   physics_warmup_epochs: 25
   use_pft: true
   pft_phase1_ratio: 0.7
-  pft_lr: 4.0e-4
+  pft_lr: 1.0e-4
 
 physics:
   diffusivity: 1.0
