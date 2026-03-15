@@ -314,6 +314,8 @@ EMIS_LOG_EPS_FEATURES = {'PM25', 'NOx', 'NH3', 'NMVOC_e', 'SO2', 'bio'}
 MASK_ONLY_FEATURES = {'NMVOC_finn'}
 LOG_EPS = np.float32(1e-12)
 DEC_STD_EPS = np.float32(1e-6)
+_DECEMBER_STATS_CACHE: dict[tuple[str, str], tuple[np.ndarray, np.ndarray]] = {}
+_HOTSPOT_MAP_CACHE: dict[tuple[str, tuple[str, ...], int], tuple[np.ndarray, np.ndarray]] = {}
 
 # ────────────────────────────────────────────────────────────────────────────
 # Grid-Wise Pixel Normalization  (Topic 2 of Ronit's preprocessing plan)
@@ -418,6 +420,8 @@ def preprocess_feature_pixelwise(arr: np.ndarray, feat: str, pixel_stats: dict) 
     """
     Log-transform + per-pixel z-score normalization (Topic 2).
 
+    Binary-mask features (rain_mask, NMVOC_finn) are exempt and kept as 0/1.
+
     Parameters
     ----------
     arr : (T, H, W) raw feature array
@@ -426,24 +430,24 @@ def preprocess_feature_pixelwise(arr: np.ndarray, feat: str, pixel_stats: dict) 
 
     Returns
     -------
-    z_norm : (T, H, W) float32  — per-pixel z-scores
+    z_norm : (T, H, W) float32 (or 0/1 mask)
     """
-    if feat == 'rain_mask':
-        return (arr > 0).astype(np.float32)
+    if feat in MASK_ONLY_FEATURES or feat == 'rain_mask' or feat.endswith('_mask'):
+        return (np.asarray(arr, dtype=np.float32) > 0).astype(np.float32)
+
     x_log = _transform_feature_values(arr, feat).astype(np.float64)   # (T, H, W)
     if feat not in pixel_stats or not isinstance(pixel_stats[feat], dict):
-        # graceful fallback: global z-score
-        mu    = float(x_log.mean())
+        mu = float(x_log.mean())
         sigma = max(float(x_log.std()), 1e-6)
         return ((x_log - mu) / sigma).astype(np.float32)
-    mu    = pixel_stats[feat]['mu'].astype(np.float64)     # (H, W)
+    mu = pixel_stats[feat]['mu'].astype(np.float64)     # (H, W)
     sigma = pixel_stats[feat]['sigma'].astype(np.float64)  # (H, W)
     return ((x_log - mu[None]) / sigma[None]).astype(np.float32)
 
 
 def denormalize_pixelwise(arr: np.ndarray, feat: str, pixel_stats: dict) -> np.ndarray:
     """
-    Inverse of per-pixel z-score normalization → physical values.
+    Inverse of per-pixel z-score normalization to physical values.
 
     Parameters
     ----------
@@ -457,34 +461,29 @@ def denormalize_pixelwise(arr: np.ndarray, feat: str, pixel_stats: dict) -> np.n
     """
     if feat not in pixel_stats or not isinstance(pixel_stats[feat], dict):
         return arr.astype(np.float32)
-    mu    = pixel_stats[feat]['mu'].astype(np.float32)     # (H, W)
+    mu = pixel_stats[feat]['mu'].astype(np.float32)     # (H, W)
     sigma = pixel_stats[feat]['sigma'].astype(np.float32)  # (H, W)
-    arr   = np.asarray(arr, dtype=np.float32)
-    # Broadcast: support (B, H, W, T) with mu/sigma (H, W)
+    arr = np.asarray(arr, dtype=np.float32)
+
     if arr.ndim == 4:
         x_log = arr * sigma[None, :, :, None] + mu[None, :, :, None]
     elif arr.ndim == 3:
         x_log = arr * sigma[:, :, None] + mu[:, :, None]
     else:
-    Log-transform + per-pixel z-score normalization (Topic 2).
+        x_log = arr.copy()
 
-    Binary-mask features (rain_mask, NMVOC_finn) are exempt — they stay as
-    0/1 indicators because z-scoring a near-binary signal destroys its
-    sparsity semantics and inflates outlier steps.
+    if feat in MET_LOG1P_FEATURES:
+        return np.expm1(x_log).astype(np.float32)
+    if feat in WIND_SIGNED_LOG1P_FEATURES:
+        return (np.sign(x_log) * np.expm1(np.abs(x_log))).astype(np.float32)
+    if feat in EMIS_LOG_EPS_FEATURES:
+        return (np.exp(x_log) - LOG_EPS).astype(np.float32)
+    if feat in MASK_ONLY_FEATURES or feat.endswith('_mask'):
+        return (x_log > 0.5).astype(np.float32)
+    return x_log.astype(np.float32)
 
-    Parameters
-    ----------
-    arr : (T, H, W) raw feature array
-    feat : feature name
-    pixel_stats : dict from compute_pixel_stats / load_pixel_stats
 
-    Returns
-    -------
-    z_norm : (T, H, W) float32  — per-pixel z-scores (or 0/1 binary mask)
-
-    # Binary/mask features stay as 0/1 — do NOT z-score them
-    if feat in MASK_ONLY_FEATURES or feat == 'rain_mask' or feat.endswith('_mask'):
-        return (np.asarray(arr, dtype=np.float32) > 0).astype(np.float32)
+def get_hotspot_maps(cfg: dict) -> tuple[np.ndarray, np.ndarray]:
     """
     Build hotspot climatology prior and spatial loss-weight map from raw cpm25.
 
