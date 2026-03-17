@@ -13,9 +13,10 @@ paths:
 
 features:
   met:  ["u10", "v10", "pblh", "rain", "t2", "q2", "swdown", "psfc"]
-  emis: ["PM25", "SO2", "NOx", "NH3", "NMVOC_e", "NMVOC_finn", "bio"]
+  emis: ["PM25", "NOx", "NH3", "NMVOC_e", "NMVOC_finn"]
   aux:  ["lat", "lon", "hour_sin", "hour_cos", "doy_sin", "doy_cos"]
   use_aux: false
+  add_masks: ["rain_mask"]
   # Full feature list = ["cpm25"] + met + emis  →  16 features total
 
 time:
@@ -30,7 +31,13 @@ data:
   months:      ["APRIL_16", "JULY_16", "OCT_16", "DEC_16"]
   val_month:   "OCT_16"
   val_split:   0.15
+  val_firewall_hours: 12
   test_samples: 996
+  december_grid_sigma_norm: true
+  use_hotspot_climatology_channel: true
+  # ── Ronit preprocessing plan (Topics 2 & 7) ───────────────────────────────
+  use_pixel_norm: true        # Topic 2: per-pixel z-score after log-transform
+  pixel_stats_path: "/kaggle/temp/pixel_stats.npz"   # save/load path (Kaggle)
 
 # ── Persistence baseline (from EDA) — values in *normalized* [0,1] space ──
 persistence:
@@ -42,18 +49,19 @@ model:
   # U-Net settings
   base_ch: 64
   # TFNO2D settings (fallback)
-  width:   32
-  modes:   12
-  depth:   3
+  width:   72
+  modes:   20
+  depth:   6
   # Residual spatiotemporal U-Net settings
   stem_ch: 48
   dropout: 0.1
+  residual_scale: 0.3
 
 models:
   tfno2d:
-    width: 32
-    modes: 12
-    depth: 3
+    width: 72
+    modes: 20
+    depth: 6
   unet:
     base_ch: 64
   res_stunet:
@@ -63,24 +71,35 @@ models:
 
 training:
   epochs:           80
-  patience:         12         # early-stopping epochs without val improvement
-  batch_size_train: 4
-  batch_size_val:   8
+  patience:         20         # larger model needs longer runway
+  batch_size_train: 2
+  batch_size_val:   4
   batch_size_test:  16
-  lr:               6.0e-4
-  weight_decay:     5.0e-3
-  pct_start:        0.1        # OneCycleLR warmup fraction (unused by coswr)
-  scheduler:        "coswr"    # cosine warm restarts; use "onecycle" to revert
-  t0_epochs:        10         # CosWR: restart period in epochs
-  t_mult:           2          # CosWR: period doubling factor (10→20→40 epochs)
-  grad_clip:        1.0
+  lr:               2.5e-4
+  weight_decay:     1.0e-4
+  pct_start:        0.2        # OneCycleLR warmup fraction
+  scheduler:        "coswr"
+  t0_epochs:        20         # CosWR: smoother first cycle for fewer restart spikes
+  t_mult:           1          # keep cycle length fixed for steadier late training
+  grad_clip:        0.3
+  residual_target:  true       # Topic 8: model predicts delta from last observed cpm25
   num_workers:      2
   pin_memory:       true
   seed:             42
   lambda_d: 1.0
-  lambda_p: 0.1
+  lambda_p: 0.02
+  physics_warmup_epochs: 25
+  use_pft: true
+  pft_phase1_ratio: 0.7
+  pft_lr: 1.0e-4
+
+physics:
+  diffusivity: 1.0
+  dx: 1.0
+  dy: 1.0
 
 loss:
+  use_spatial_hotspot_weight: true
   horizon_weight_min: 0.8
   horizon_weight_max: 1.4
   rmse_weight: 0.8

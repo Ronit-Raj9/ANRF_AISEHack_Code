@@ -1,14 +1,17 @@
 import torch
-from torch.utils.data import Dataset, DataLoader, TensorDataset, random_split
+from torch.utils.data import Dataset, DataLoader, TensorDataset, Subset
 
 # Sliding window dataset for time series
 class SlidingWindowTensorDataset(Dataset):
-    def __init__(self, tensor, window_size, t_out, target_channel=0):
+    def __init__(self, tensor, window_size, t_out, target_channel=0, t_in_cpm=None):
         # tensor: (N, C, T, H, W)
+        # t_in_cpm: if set, future cpm25 (channel target_channel, steps t_in_cpm:) are
+        #           zeroed out to match the test-time masking condition.
         self.tensor = tensor
         self.window_size = window_size
         self.t_out = t_out
         self.target_channel = target_channel
+        self.t_in_cpm = t_in_cpm  # None means no masking (backward compat)
         self.N, self.C, self.T, self.H, self.W = tensor.shape
         self.num_windows = self.T - window_size - t_out + 1
         if self.num_windows <= 0:
@@ -29,6 +32,10 @@ class SlidingWindowTensorDataset(Dataset):
         y_end = y_start + self.t_out
         yb = self.tensor[n, self.target_channel, y_start:y_end, :, :]  # (T_out, H, W)
         xb = torch.tensor(xb, dtype=torch.float32)
+        # Mask future cpm25 (hours t_in_cpm onwards) so training matches test-time
+        # conditions: at test time only t_in_cpm observed hours are available.
+        if self.t_in_cpm is not None and self.t_in_cpm < self.window_size:
+            xb[self.target_channel, self.t_in_cpm:] = 0.0
         yb = torch.tensor(yb, dtype=torch.float32).permute(1, 2, 0)  # (H, W, T_out)
         return xb, yb
 
@@ -36,7 +43,7 @@ class SlidingWindowTensorDataset(Dataset):
 Data loading, normalization, sample construction, and PyTorch Dataset.
  
 Design notes:
-- Normalization: official min-max from feat_min_max.mat → clip to [0, 1].
+- Normalization: official min-max from feat_min_max.mat -> clip to [0, 1].
     This ensures train/test consistency and makes the persistence RMSE gate
     directly interpretable (threshold = 0.0208 in normalized space).
 - Preprocessing: append static geography (`lat`, `lon`) and calendar signals
@@ -58,11 +65,35 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, TensorDataset
 
-def add_physical_features(tensor, features_dict=None, lat_long_path='lat_long.npy'):
+# -- Month name -> integer (1-12) helper for month encoding ------------------
+_MONTH_NAME_TO_NUM = {
+    'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'APRIL': 4,
+    'MAY': 5, 'JUN': 6, 'JUNE': 6, 'JUL': 7, 'JULY': 7,
+    'AUG': 8, 'SEP': 9, 'SEPT': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12,
+}
+
+def _month_num_from_name(name: str) -> int:
+    """Parse month number (1-12) from strings like 'APRIL_16', 'DEC_16', etc."""
+    upper = name.upper()
+    for key, val in _MONTH_NAME_TO_NUM.items():
+        if upper.startswith(key):
+            return val
+    return 1  # fallback
+
+
+def add_physical_features(tensor, features_dict=None, lat_long_path='lat_long.npy', cfg=None, months=None):
     """
-    Add 12 engineered physics channels for PINO in a memory-efficient way:
+        Add engineered physics channels for PINO in a memory-efficient way:
       wind_speed, wind_dir, RH, hour_sin, hour_cos, month_sin, month_cos,
-      lat, lon, lag_1, lag_3, lag_6
+            hotspot_clim, lag_1, lag_3, lag_6
+
+    Parameters
+    ----------
+    months : list of str, optional
+        Month name strings (e.g. ['APRIL_16', 'JULY_16', ...]) of length N.
+        When provided, month_sin/cos are computed from the actual calendar month
+        for each month in the batch, fixing the constant-placeholder bug.
+        When None, falls back to the legacy constant placeholder.
 
     Memory strategy: pre-allocate a single float32 output array and fill each
     engineered channel one at a time (rather than materialising a large stack).
@@ -74,9 +105,10 @@ def add_physical_features(tensor, features_dict=None, lat_long_path='lat_long.np
     # ── Normalise dtype to float32 immediately ───────────────────────────────
     tensor = np.asarray(tensor, dtype=np.float32)
     N, C, T, H, W = tensor.shape
-    N_ENG = 12
+    N_ENG = 12   # wind_speed, wind_dir, ventilation_idx, rh, hour_sin, hour_cos,
+                 # month_sin, month_cos, hotspot, lag_1, lag_3, lag_6
 
-    # Pre-allocate output: (N, C+12, T, H, W) float32
+    # Pre-allocate output: (N, C+N_ENG, T, H, W) float32
     out = np.empty((N, C + N_ENG, T, H, W), dtype=np.float32)
     out[:, :C] = tensor          # copy base channels (no extra alloc beyond out)
     ch = C                       # next free channel index
@@ -84,13 +116,21 @@ def add_physical_features(tensor, features_dict=None, lat_long_path='lat_long.np
     # ── Wind speed ──────────────────────────────────────────────────────────
     u10 = tensor[:, features_dict['u10'], :, :, :]   # (N,T,H,W) view, float32
     v10 = tensor[:, features_dict['v10'], :, :, :]
-    out[:, ch] = np.sqrt(u10 ** 2 + v10 ** 2)
+    wind_speed = np.sqrt(u10 ** 2 + v10 ** 2)
+    out[:, ch] = wind_speed
     ch += 1
 
     # ── Wind direction ───────────────────────────────────────────────────────
     out[:, ch] = np.arctan2(v10, u10)
     ch += 1
-    del u10, v10
+
+    # ── Ventilation Index = PBLH × wind_speed (Topic 6) ─────────────────────
+    # Captures the joint dispersal capacity: high PBLH AND strong winds
+    # both needed to ventilate the boundary layer of pollution.
+    pblh = tensor[:, features_dict['pblh'], :, :, :]   # (N,T,H,W)
+    out[:, ch] = pblh * wind_speed
+    ch += 1
+    del u10, v10, pblh, wind_speed
     gc.collect()
 
     # ── Relative humidity ────────────────────────────────────────────────────
@@ -99,9 +139,14 @@ def add_physical_features(tensor, features_dict=None, lat_long_path='lat_long.np
     denom_safe = np.where(np.abs(t2 - 29.65) < 1e-3,
                           np.sign(t2 - 29.65 + np.float32(1e-3)) * np.float32(1e-3),
                           t2 - np.float32(29.65)).astype(np.float32)
-    exponent = np.clip(np.float32(17.67) * (t2 - np.float32(273.15)) / denom_safe,
-                       np.float32(-100.0), np.float32(100.0))
-    rh = q2 / (np.float32(0.622) + np.float32(0.378) * q2 + np.float32(1e-8)) * np.exp(exponent)
+    exponent = np.clip(
+        np.float32(17.67) * (t2 - np.float32(273.15)) / denom_safe,
+        np.float32(-87.0),
+        np.float32(87.0),
+    )
+    with np.errstate(over='ignore', invalid='ignore'):
+        rh = q2 / (np.float32(0.622) + np.float32(0.378) * q2 + np.float32(1e-8)) * np.exp(exponent)
+    np.nan_to_num(rh, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
     out[:, ch] = np.clip(rh, np.float32(0.0), np.float32(1.5))
     ch += 1
     del t2, q2, denom_safe, exponent, rh
@@ -112,33 +157,50 @@ def add_physical_features(tensor, features_dict=None, lat_long_path='lat_long.np
     for vals in [
         np.sin(np.float32(2 * np.pi) * hour / np.float32(24)),
         np.cos(np.float32(2 * np.pi) * hour / np.float32(24)),
-        np.full(T, np.sin(np.float32(2 * np.pi / 12)), dtype=np.float32),  # placeholder month
-        np.full(T, np.cos(np.float32(2 * np.pi / 12)), dtype=np.float32),
     ]:
-        # Assign (T,) → (N, T, H, W) via numpy broadcasting during assignment
         out[:, ch] = vals.reshape(1, T, 1, 1)
         ch += 1
+
+    # -- Month encoding - per-month if months list provided, else constant ----
+    # The constant placeholder (sin(2π/12)) was the same scalar for every month
+    # in the batch, making the channels completely uninformative.  With the
+    # months list we compute the correct calendar-month encoding per sample.
+    if months is not None and len(months) == N:
+        for n_idx in range(N):
+            m_num = np.float32(_month_num_from_name(months[n_idx]))
+            out[n_idx, ch]     = np.sin(np.float32(2 * np.pi) * m_num / np.float32(12))
+            out[n_idx, ch + 1] = np.cos(np.float32(2 * np.pi) * m_num / np.float32(12))
+    else:
+        # Legacy fallback: constant placeholder (backward compatibility)
+        out[:, ch]     = np.sin(np.float32(2 * np.pi / 12))
+        out[:, ch + 1] = np.cos(np.float32(2 * np.pi / 12))
+    ch += 2
     del hour
     gc.collect()
 
-    # ── Static lat / lon ────────────────────────────────────────────────────
-    ll = np.load(lat_long_path).astype(np.float32)
-    lat = ll[:, :, 0];  lon = ll[:, :, 1]
-    lat = (lat - lat.min()) / (lat.max() - lat.min() + np.float32(1e-8))
-    lon = (lon - lon.min()) / (lon.max() - lon.min() + np.float32(1e-8))
-    out[:, ch] = lat.reshape(1, 1, H, W)   # (1,1,H,W) broadcasts to (N,T,H,W)
+    # ── Static hotspot climatology prior ────────────────────────────────────
+    if cfg is not None and cfg.get('data', {}).get('use_hotspot_climatology_channel', True):
+        prior_map, _ = get_hotspot_maps(cfg)
+    else:
+        # fallback: derive prior from already-loaded cpm25 channel
+        cpm = tensor[:, features_dict['cpm25'], :, :, :]
+        prior_map = np.log1p(np.clip(np.mean(cpm, axis=(0, 1)), 0.0, None)).astype(np.float32)
+        prior_map = (prior_map - prior_map.mean()) / (prior_map.std() + np.float32(1e-6))
+    out[:, ch] = prior_map.reshape(1, 1, H, W)
     ch += 1
-    out[:, ch] = lon.reshape(1, 1, H, W)
-    ch += 1
-    del ll, lat, lon
+    del prior_map
     gc.collect()
 
     # ── PM2.5 lags ───────────────────────────────────────────────────────────
+    # np.roll wraps the boundary: lag_6[t=0..5] would incorrectly contain the
+    # last frames of the same month.  Zero-pad the boundary instead.
     cpm25 = tensor[:, features_dict['cpm25'], :, :, :].copy()
-    out[:, ch] = np.roll(cpm25, 1, axis=1);  ch += 1   # axis=1 is T in (N,T,H,W)
-    out[:, ch] = np.roll(cpm25, 3, axis=1);  ch += 1
-    out[:, ch] = np.roll(cpm25, 6, axis=1);  ch += 1
-    del cpm25
+    for lag_steps in (1, 3, 6):
+        lagged = np.roll(cpm25, lag_steps, axis=1)
+        lagged[:, :lag_steps, :, :] = 0.0  # clear wrapped-around values
+        out[:, ch] = lagged
+        ch += 1
+    del cpm25, lagged
     gc.collect()
 
     assert ch == C + N_ENG, f"Channel count mismatch: expected {C + N_ENG}, got {ch}"
@@ -226,9 +288,330 @@ def normalize(arr: np.ndarray, fmin: float, fmax: float) -> np.ndarray:
     return np.clip(normed, 0.0, 1.0)
 
 
-def denormalize(arr: np.ndarray, fmin: float, fmax: float) -> np.ndarray:
-    """Inverse of min-max normalization."""
-    return arr.astype(np.float32) * (fmax - fmin) + fmin
+def denormalize(arr: np.ndarray, fmin: float, fmax: float, feat: str = 'cpm25') -> np.ndarray:
+    """Inverse of preprocessing-aware normalization for a feature (default: cpm25)."""
+    lo_t, hi_t = _transform_bounds(fmin, fmax, feat)
+    x = arr.astype(np.float32) * (hi_t - lo_t) + lo_t
+
+    if feat in MET_LOG1P_FEATURES:
+        return np.expm1(x).astype(np.float32)
+
+    if feat in WIND_SIGNED_LOG1P_FEATURES:
+        return (np.sign(x) * np.expm1(np.abs(x))).astype(np.float32)
+
+    if feat in EMIS_LOG_EPS_FEATURES:
+        return (np.exp(x) - LOG_EPS).astype(np.float32)
+
+    if feat in MASK_ONLY_FEATURES or feat.endswith('_mask'):
+        return (x > 0.5).astype(np.float32)
+
+    return x.astype(np.float32)
+
+
+MET_LOG1P_FEATURES = {'cpm25', 't2', 'pblh', 'q2', 'swdown', 'psfc', 'rain'}
+WIND_SIGNED_LOG1P_FEATURES = {'u10', 'v10'}
+EMIS_LOG_EPS_FEATURES = {'PM25', 'NOx', 'NH3', 'NMVOC_e', 'SO2', 'bio'}
+MASK_ONLY_FEATURES = {'NMVOC_finn'}
+LOG_EPS = np.float32(1e-12)
+DEC_STD_EPS = np.float32(1e-6)
+_DECEMBER_STATS_CACHE: dict[tuple[str, str], tuple[np.ndarray, np.ndarray]] = {}
+_HOTSPOT_MAP_CACHE: dict[tuple[str, tuple[str, ...], int], tuple[np.ndarray, np.ndarray]] = {}
+
+# ────────────────────────────────────────────────────────────────────────────
+# Grid-Wise Pixel Normalization  (Topic 2 of Ronit's preprocessing plan)
+# ────────────────────────────────────────────────────────────────────────────
+
+def compute_pixel_stats(cfg: dict, months: list, bounds: dict) -> dict:
+    """
+    Compute per-pixel (H, W) mean and std for each feature after log-transform,
+    using training months only (pass cfg['data']['train_months']).
+
+    Returns
+    -------
+    pixel_stats : dict  {feat: {'mu': (H, W) float32, 'sigma': (H, W) float32}}
+    """
+    import gc
+    features = cfg['features']['all']          # base features (no mask suffixes)
+    data_dir = cfg['paths']['data']
+
+    H, W = None, None
+    sum_map: dict[str, np.ndarray] = {}
+    sq_sum_map: dict[str, np.ndarray] = {}
+    count = 0
+
+    for month in months:
+        print(f"  Computing pixel stats for {month} ...", end=" ", flush=True)
+        for feat in features:
+            # Skip binary indicators - they are kept as 0/1 and don't need pixel z-score
+            if feat in MASK_ONLY_FEATURES or feat == 'rain_mask' or feat.endswith('_mask'):
+                continue
+            path = os.path.join(data_dir, 'raw', month, f'{feat}.npy')
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Missing file for pixel stats: {path}")
+            arr = np.load(path).astype(np.float32)   # (T, H, W)
+            if H is None:
+                H, W = arr.shape[1], arr.shape[2]
+            x_log = _transform_feature_values(arr, feat)   # (T, H, W)
+            if feat not in sum_map:
+                sum_map[feat]    = np.zeros((H, W), dtype=np.float64)
+                sq_sum_map[feat] = np.zeros((H, W), dtype=np.float64)
+            sum_map[feat]    += x_log.sum(axis=0).astype(np.float64)
+            sq_sum_map[feat] += (x_log.astype(np.float64) ** 2).sum(axis=0)
+            del arr, x_log
+            gc.collect()
+
+        # Count T from the first real feature this month
+        first_feat = next(f for f in features if f != 'rain_mask')
+        T_month = np.load(
+            os.path.join(data_dir, 'raw', month, f'{first_feat}.npy'),
+            mmap_mode='r',
+        ).shape[0]
+        count += T_month
+        print("OK")
+
+    pixel_stats: dict = {}
+    N = float(count)
+    for feat in features:
+        if feat in MASK_ONLY_FEATURES or feat == 'rain_mask' or feat.endswith('_mask'):
+            continue
+        mu       = (sum_map[feat] / N).astype(np.float32)
+        variance = np.maximum(
+            sq_sum_map[feat] / N - (sum_map[feat] / N) ** 2,
+            0.0,
+        ).astype(np.float32)
+        sigma = np.maximum(np.sqrt(variance + 1e-12), np.float32(1e-6)).astype(np.float32)
+        pixel_stats[feat] = {'mu': mu, 'sigma': sigma}
+
+    print(f"Pixel stats computed from {len(months)} months, {int(count)} time steps, grid ({H},{W}).")
+    return pixel_stats
+
+
+def save_pixel_stats(pixel_stats: dict, path: str) -> None:
+    """Save pixel stats dict to a .npz file."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    flat: dict = {}
+    for feat, d in pixel_stats.items():
+        if isinstance(d, dict):
+            flat[f'{feat}__mu']    = d['mu']
+            flat[f'{feat}__sigma'] = d['sigma']
+        else:
+            flat[feat] = d
+    np.savez(path, **flat)
+    print(f"Pixel stats saved -> {path}")
+
+
+def load_pixel_stats(path: str) -> dict:
+    """Load pixel stats from a .npz file produced by save_pixel_stats."""
+    data = np.load(path)
+    pixel_stats: dict = {}
+    for key in data.files:
+        if key.endswith('__mu'):
+            feat = key[:-4]
+            pixel_stats.setdefault(feat, {})['mu'] = data[key]
+        elif key.endswith('__sigma'):
+            feat = key[:-7]
+            pixel_stats.setdefault(feat, {})['sigma'] = data[key]
+        else:
+            pixel_stats[key] = data[key]
+    return pixel_stats
+
+
+def preprocess_feature_pixelwise(arr: np.ndarray, feat: str, pixel_stats: dict) -> np.ndarray:
+    """
+    Log-transform + per-pixel z-score normalization (Topic 2).
+
+    Binary-mask features (rain_mask, NMVOC_finn) are exempt and kept as 0/1.
+
+    Parameters
+    ----------
+    arr : (T, H, W) raw feature array
+    feat : feature name
+    pixel_stats : dict from compute_pixel_stats / load_pixel_stats
+
+    Returns
+    -------
+    z_norm : (T, H, W) float32 (or 0/1 mask)
+    """
+    if feat in MASK_ONLY_FEATURES or feat == 'rain_mask' or feat.endswith('_mask'):
+        return (np.asarray(arr, dtype=np.float32) > 0).astype(np.float32)
+
+    x_log = _transform_feature_values(arr, feat).astype(np.float64)   # (T, H, W)
+    if feat not in pixel_stats or not isinstance(pixel_stats[feat], dict):
+        mu = float(x_log.mean())
+        sigma = max(float(x_log.std()), 1e-6)
+        return ((x_log - mu) / sigma).astype(np.float32)
+    mu = pixel_stats[feat]['mu'].astype(np.float64)     # (H, W)
+    sigma = pixel_stats[feat]['sigma'].astype(np.float64)  # (H, W)
+    return ((x_log - mu[None]) / sigma[None]).astype(np.float32)
+
+
+def denormalize_pixelwise(arr: np.ndarray, feat: str, pixel_stats: dict) -> np.ndarray:
+    """
+    Inverse of per-pixel z-score normalization to physical values.
+
+    Parameters
+    ----------
+    arr : (..., H, W, T) or (B, H, W, T) predicted z-scores
+    feat : feature name (default use-case: 'cpm25')
+    pixel_stats : dict from load_pixel_stats
+
+    Returns
+    -------
+    physical : same shape as arr, dtype float32
+    """
+    if feat not in pixel_stats or not isinstance(pixel_stats[feat], dict):
+        return arr.astype(np.float32)
+    mu = pixel_stats[feat]['mu'].astype(np.float32)     # (H, W)
+    sigma = pixel_stats[feat]['sigma'].astype(np.float32)  # (H, W)
+    arr = np.asarray(arr, dtype=np.float32)
+
+    if arr.ndim == 4:
+        x_log = arr * sigma[None, :, :, None] + mu[None, :, :, None]
+    elif arr.ndim == 3:
+        x_log = arr * sigma[:, :, None] + mu[:, :, None]
+    else:
+        x_log = arr.copy()
+
+    if feat in MET_LOG1P_FEATURES:
+        return np.expm1(x_log).astype(np.float32)
+    if feat in WIND_SIGNED_LOG1P_FEATURES:
+        return (np.sign(x_log) * np.expm1(np.abs(x_log))).astype(np.float32)
+    if feat in EMIS_LOG_EPS_FEATURES:
+        return (np.exp(x_log) - LOG_EPS).astype(np.float32)
+    if feat in MASK_ONLY_FEATURES or feat.endswith('_mask'):
+        return (x_log > 0.5).astype(np.float32)
+    return x_log.astype(np.float32)
+
+
+def get_hotspot_maps(cfg: dict) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build hotspot climatology prior and spatial loss-weight map from raw cpm25.
+
+    Returns
+    -------
+    prior_z : (H, W) float32
+        log1p(climatology) standardized to zero mean / unit std.
+    weights : (H, W) float32
+        log1p(climatology) normalized so global mean weight = 1.0.
+    """
+    data_dir = cfg['paths']['data']
+    months = tuple(cfg.get('data', {}).get('train_months', cfg['data']['months']))
+    t_in_cpm = int(cfg.get('time', {}).get('t_in_cpm', 10))
+    cache_key = (data_dir, months, t_in_cpm)
+    if cache_key in _HOTSPOT_MAP_CACHE:
+        return _HOTSPOT_MAP_CACHE[cache_key]
+
+    sum_map = None
+    count = 0
+    for month in months:
+        cpm_path = os.path.join(data_dir, 'raw', month, 'cpm25.npy')
+        if not os.path.exists(cpm_path):
+            raise FileNotFoundError(f"Missing cpm25 file for hotspot climatology: {cpm_path}")
+        arr = np.load(cpm_path).astype(np.float32)  # (T,H,W)
+        if arr.ndim != 3:
+            raise ValueError(f"Unexpected cpm25 shape in {cpm_path}: {arr.shape}")
+        month_sum = np.sum(arr, axis=0)
+        if sum_map is None:
+            sum_map = month_sum
+        else:
+            sum_map += month_sum
+        count += arr.shape[0]
+
+    if sum_map is None or count <= 0:
+        raise RuntimeError("Failed to build hotspot climatology map (empty training cpm25).")
+
+    clim_raw = (sum_map / np.float32(count)).astype(np.float32)
+    clim_log = np.log1p(np.clip(clim_raw, 0.0, None)).astype(np.float32)
+
+    prior_mean = float(np.mean(clim_log))
+    prior_std = float(np.std(clim_log))
+    prior_z = ((clim_log - np.float32(prior_mean)) / np.float32(prior_std + 1e-6)).astype(np.float32)
+
+    weights = (clim_log / np.float32(np.mean(clim_log) + 1e-6)).astype(np.float32)
+    _HOTSPOT_MAP_CACHE[cache_key] = (prior_z, weights)
+    return prior_z, weights
+
+
+def _transform_feature_values(arr: np.ndarray, feat: str) -> np.ndarray:
+    """Apply feature-specific numeric transforms before normalization."""
+    x = np.asarray(arr, dtype=np.float32)
+
+    if feat in WIND_SIGNED_LOG1P_FEATURES:
+        return np.sign(x) * np.log1p(np.abs(x))
+
+    if feat in MET_LOG1P_FEATURES:
+        return np.log1p(np.clip(x, 0.0, None))
+
+    if feat in EMIS_LOG_EPS_FEATURES:
+        return np.log(np.clip(x, 0.0, None) + LOG_EPS)
+
+    if feat in MASK_ONLY_FEATURES:
+        return (x > 0).astype(np.float32)
+
+    return x
+
+
+def _transform_bounds(fmin: float, fmax: float, feat: str) -> tuple[float, float]:
+    """Transform min-max bounds into the same numeric domain as feature values."""
+    lo = np.float32(fmin)
+    hi = np.float32(fmax)
+
+    if feat in WIND_SIGNED_LOG1P_FEATURES:
+        lo_t = np.sign(lo) * np.log1p(np.abs(lo))
+        hi_t = np.sign(hi) * np.log1p(np.abs(hi))
+    elif feat in MET_LOG1P_FEATURES:
+        lo_t = np.log1p(np.clip(lo, 0.0, None))
+        hi_t = np.log1p(np.clip(hi, 0.0, None))
+    elif feat in EMIS_LOG_EPS_FEATURES:
+        lo_t = np.log(np.clip(lo, 0.0, None) + LOG_EPS)
+        hi_t = np.log(np.clip(hi, 0.0, None) + LOG_EPS)
+    elif feat in MASK_ONLY_FEATURES or feat.endswith('_mask'):
+        return 0.0, 1.0
+    else:
+        lo_t, hi_t = lo, hi
+
+    return float(min(lo_t, hi_t)), float(max(lo_t, hi_t))
+
+
+def preprocess_feature(arr: np.ndarray, feat: str, bounds: dict, month: str | None = None) -> np.ndarray:
+    """
+    Feature-specific preprocessing + normalization.
+
+    - Meteo/cpm25 scalar fields: log1p domain (or signed-log1p for winds)
+    - Emissions: log(x+1e-12) in float32-safe range
+    - NMVOC_finn: binary mask only
+    - PBLH: season-aware scaling via month-local min-max after transform
+    """
+    x = _transform_feature_values(arr, feat)
+
+    # NOTE: PBLH previously used per-month local min-max when month was given,
+    # but global bounds at test time (month=None).  This created a train/test
+    # distribution mismatch - PBLH summer peaks could clip completely differently.
+    # Fix: always use the global official bounds from feat_min_max.mat.
+
+    fmin, fmax = _transform_bounds(*bounds[feat], feat)
+    return normalize(x, fmin, fmax)
+
+
+def _get_december_grid_stats(cfg: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Return (mu, sigma) over time for DEC_16 cpm25 in log1p domain, cached per data root."""
+    data_dir = cfg['paths']['data']
+    dec_month = cfg.get('data', {}).get('december_month', 'DEC_16')
+    cache_key = (data_dir, dec_month)
+    if cache_key in _DECEMBER_STATS_CACHE:
+        return _DECEMBER_STATS_CACHE[cache_key]
+
+    dec_path = os.path.join(data_dir, 'raw', dec_month, 'cpm25.npy')
+    if not os.path.exists(dec_path):
+        raise FileNotFoundError(f"December cpm25 file not found for grid-wise sigma stats: {dec_path}")
+
+    dec_raw = np.load(dec_path).astype(np.float32)  # (T,H,W)
+    dec_log = _transform_feature_values(dec_raw, 'cpm25')
+    mu = np.mean(dec_log, axis=0).astype(np.float32)
+    sigma = np.std(dec_log, axis=0).astype(np.float32)
+    sigma = np.maximum(sigma, DEC_STD_EPS)
+    _DECEMBER_STATS_CACHE[cache_key] = (mu, sigma)
+    return mu, sigma
 
 
 def _broadcast_scalar_series(values: np.ndarray, H: int, W: int) -> np.ndarray:
@@ -308,9 +691,12 @@ def build_aux_feature_maps(cfg, time_arr: np.ndarray | None, T: int, H: int, W: 
 # Month-level Data Loading
 # ─────────────────────────────────────────────
 
-def _load_month(cfg, month: str, bounds: dict) -> dict:
+def _load_month(cfg, month: str, bounds: dict, pixel_stats: dict | None = None) -> dict:
     """
     Load and normalize all features for one month.
+
+    When pixel_stats is provided (and cfg['data']['use_pixel_norm'] is True),
+    applies per-pixel z-score normalization (Topic 2) instead of global min-max.
 
     Returns
     -------
@@ -318,8 +704,24 @@ def _load_month(cfg, month: str, bounds: dict) -> dict:
     """
     features = cfg['features']['base']
     data_dir = cfg['paths']['data']
-    data = {}
+    use_pixel_norm = (
+        pixel_stats is not None
+        and cfg.get('data', {}).get('use_pixel_norm', False)
+    )
+    data = {'__month__': month}
+    raw_cache = {}
     for feat in features:
+        if feat == 'rain_mask':
+            if 'rain' not in raw_cache:
+                rain_path = os.path.join(data_dir, 'raw', month, 'rain.npy')
+                print(f"Trying to load: {rain_path}")
+                if not os.path.exists(rain_path):
+                    print(f"File missing: {rain_path}")
+                    raise FileNotFoundError(f"Missing file: {rain_path}")
+                raw_cache['rain'] = np.load(rain_path)
+            data[feat] = (raw_cache['rain'] > 0).astype(np.float32)
+            continue
+
         path = os.path.join(data_dir, 'raw', month, f'{feat}.npy')
         print(f"Trying to load: {path}")
         if not os.path.exists(path):
@@ -330,7 +732,35 @@ def _load_month(cfg, month: str, bounds: dict) -> dict:
         except Exception as e:
             print(f"Failed to load {path}: {e}")
             raise
-        data[feat] = normalize(arr, *bounds[feat])
+        raw_cache[feat] = arr
+
+        if use_pixel_norm:
+            data[feat] = preprocess_feature_pixelwise(arr, feat, pixel_stats)
+        else:
+            data[feat] = preprocess_feature(arr, feat, bounds, month=month)
+
+        if feat == 'cpm25':
+            data['__cpm25_log1p__'] = _transform_feature_values(arr, 'cpm25').astype(np.float32)
+
+    # December per-grid sigma norm is superseded by full pixel normalization;
+    # only apply it when pixel_norm is disabled.
+    if (
+        not use_pixel_norm
+        and month.upper().startswith('DEC')
+        and cfg.get('data', {}).get('december_grid_sigma_norm', True)
+    ):
+        mu, sigma = _get_december_grid_stats(cfg)
+        data['__dec_mu__'] = mu
+        data['__dec_sigma__'] = sigma
+
+    # Sanity: emission z-scores must have non-zero variance
+    # (Only meaningful for global min-max norm; skip for pixel norm to avoid
+    # false positives from near-zero z-score ranges near the grid boundary.)
+    for emis_feat in ('PM25', 'NOx', 'NH3', 'NMVOC_e'):
+        if emis_feat in data:
+            std = float(np.std(data[emis_feat]))
+            if not use_pixel_norm and std <= 0.0:
+                raise RuntimeError(f"Emission feature {emis_feat} collapsed to zero variance after preprocessing.")
 
     if 'cpm25' not in data:
         print(f"cpm25 missing in month {month}, skipping.")
@@ -342,22 +772,24 @@ def _load_month(cfg, month: str, bounds: dict) -> dict:
     return data
 
 
-def load_all_months(cfg, months: list, bounds: dict) -> list:
+def load_all_months(cfg, months: list, bounds: dict, pixel_stats: dict | None = None) -> list:
     """
     Load and normalize multiple months.  Returns a list of dicts (one per month).
     Memory: ~750 MB per month × 16 features (140×124 grid, float32).
+
+    When pixel_stats is provided the per-pixel z-score path (Topic 2) is used.
     """
     all_data = []
     for m in months:
         print(f"  Loading {m} ...", end=" ", flush=True)
-        all_data.append(_load_month(cfg, m, bounds))
+        all_data.append(_load_month(cfg, m, bounds, pixel_stats=pixel_stats))
         print("OK")
         gc.collect()
     return all_data
 
 
 # ─────────────────────────────────────────────
-# PyTorch Dataset — Lazy Sliding Windows
+# PyTorch Dataset - Lazy Sliding Windows
 
 def make_dataloaders(cfg, tensor, bounds):
     batch_size = cfg['training']['batch_size_train']
@@ -366,19 +798,53 @@ def make_dataloaders(cfg, tensor, bounds):
     t_out = cfg['time']['t_out']
     val_split = cfg['data'].get('val_split', 0.1)
 
-    # Build windows from the full tensor first, then split window indices.
-    # This uses all available months/data instead of dropping entire months
-    # based on a month-level split.
-    full_ds = SlidingWindowTensorDataset(tensor, window_size, t_out=t_out, target_channel=0)
-    n_total = len(full_ds)
-    n_val = max(1, int(n_total * val_split))
-    n_train = n_total - n_val
-    if n_train <= 0:
-        raise ValueError(f"Invalid val_split={val_split}; not enough windows for training.")
+    # Build windows from the full tensor first.
+    # t_in_cpm: masks future cpm25 hours (t_in_cpm:window_size) to zeros so
+    # training matches test-time conditions (only 10 observed hours available).
+    t_in_cpm = cfg['time'].get('t_in_cpm', 10)
+    full_ds = SlidingWindowTensorDataset(
+        tensor, window_size, t_out=t_out, target_channel=0, t_in_cpm=t_in_cpm
+    )
 
-    seed = cfg.get('training', {}).get('seed', 42)
-    generator = torch.Generator().manual_seed(seed)
-    train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=generator)
+    # ── Temporal firewall split (no random leakage) ─────────────────────────
+    # Use the LAST val_split windows of each month for validation, and exclude
+    # train windows within ±firewall_hours from the train/val boundary.
+    # This avoids adjacent-window leakage that can produce unrealistically low
+    # validation RMSE.
+    firewall_hours = int(cfg.get('data', {}).get('val_firewall_hours', 12))
+    n_months = full_ds.N
+    windows_per_month = full_ds.num_windows
+
+    train_indices = []
+    val_indices = []
+
+    for month_idx in range(n_months):
+        n_val_m = max(1, int(windows_per_month * val_split))
+        val_start = windows_per_month - n_val_m
+
+        # Validation block: tail windows in this month.
+        for w in range(val_start, windows_per_month):
+            val_indices.append(month_idx * windows_per_month + w)
+
+        # Training block: strictly before firewall boundary.
+        train_end = max(0, val_start - firewall_hours)
+        for w in range(0, train_end):
+            train_indices.append(month_idx * windows_per_month + w)
+
+    if len(train_indices) == 0 or len(val_indices) == 0:
+        raise ValueError(
+            "Temporal firewall split produced empty train/val set. "
+            "Reduce val_split or val_firewall_hours."
+        )
+
+    train_ds = Subset(full_ds, train_indices)
+    val_ds = Subset(full_ds, val_indices)
+
+    print(
+        f"Temporal split enabled: windows/month={windows_per_month}, "
+        f"val_split={val_split:.2f}, firewall={firewall_hours}h | "
+        f"train={len(train_ds):,}, val={len(val_ds):,}"
+    )
 
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_dl = DataLoader(val_ds, batch_size=val_batch_size, shuffle=False)
@@ -390,10 +856,10 @@ class PM25Dataset(Dataset):
     Lazy sliding-window PM2.5 dataset.
 
     Window logic (per EDA):
-    - Input  : met/emis[t : t+T_IN_MET]  — 26 hrs (10 past + 16 NWP forecast)
-               cpm25  [t : t+T_IN_CPM]   — 10 hrs known; hours 10-25 → 0.0
+    - Input  : met/emis[t : t+T_IN_MET]  - 26 hrs (10 past + 16 NWP forecast)
+               cpm25  [t : t+T_IN_CPM]   - 10 hrs known; hours 10-25 -> 0.0
     - Target : cpm25  [t+T_IN_CPM :
-                       t+T_IN_CPM+T_OUT]  — next 16 hrs (normalized)
+                       t+T_IN_CPM+T_OUT]  - next 16 hrs (normalized)
     Both input and target are in normalized [0, 1] space.
 
     Output shapes
@@ -409,6 +875,7 @@ class PM25Dataset(Dataset):
         self.t_cpm    = cfg['time']['t_in_cpm']    # 10
         self.t_out    = cfg['time']['t_out']        # 16
         self.cpm_idx  = 0                           # cpm25 is always index 0
+        self.december_sigma_norm = bool(cfg.get('data', {}).get('december_grid_sigma_norm', True))
 
         # Build (month_idx, start_t) index
         self.index = []
@@ -433,11 +900,18 @@ class PM25Dataset(Dataset):
         for feat in self.feats:
             chunk = mdata[feat][t : t + t_in].copy()  # (T_in, H, W)
             if feat == 'cpm25':
+                month_name = str(mdata.get('__month__', '')).upper()
+                if self.december_sigma_norm and month_name.startswith('DEC') and '__cpm25_log1p__' in mdata:
+                    mu = mdata.get('__dec_mu__', None)
+                    sigma = mdata.get('__dec_sigma__', None)
+                    if mu is not None and sigma is not None:
+                        cpm_log_chunk = mdata['__cpm25_log1p__'][t : t + t_in].copy()
+                        chunk = ((cpm_log_chunk - mu[None, :, :]) / sigma[None, :, :]).astype(np.float32)
                 chunk[t_cpm:] = 0.0   # mask future cpm25 (not available at test time)
             channels.append(chunk)
         x = torch.from_numpy(np.stack(channels, axis=0))  # (C, T, H, W)
 
-        # ── Target (H, W, T_out) — normalized cpm25 ──
+        # -- Target (H, W, T_out) - normalized cpm25 --
         y_arr = mdata['cpm25'][t + t_cpm : t + t_cpm + t_out]  # (T_out, H, W)
         y = torch.from_numpy(y_arr).permute(1, 2, 0)            # (H, W, T_out)
 
@@ -484,40 +958,67 @@ def get_dataloaders(cfg, train_data: list, val_data: list, bounds: dict):
     return train_dl, val_dl
 
 
-def build_test_input(cfg, bounds: dict, start: int = 0, end: int | None = None) -> np.ndarray:
+def build_test_input(cfg, bounds: dict, start: int = 0, end: int | None = None,
+                     pixel_stats: dict | None = None) -> np.ndarray:
     """
     Build normalized test tensor with auxiliary channels.
 
     Parameters
     ----------
     start, end : int
-        Half-open index range [start, end). This enables memory-safe chunked
-        inference. If `end` is None, it defaults to `n_test`.
+        Half-open index range [start, end). Enables memory-safe chunked inference.
+    pixel_stats : dict, optional
+        When provided and cfg['data']['use_pixel_norm'] is True, applies per-pixel
+        z-score normalization (Topic 2) instead of global min-max.
 
     Returns
     -------
     X_test : (end-start, C=input_channels, T=26, H, W) float32
     """
-    features  = cfg['features']['base']
+    features    = cfg['features']['base']
     input_feats = cfg['features']['input']
-    data_dir   = cfg['paths']['data']
-    t_in_cpm   = cfg['time']['t_in_cpm']
-    t_in_met   = cfg['time']['t_in_met']
-    n_test     = cfg['data']['test_samples']
+    data_dir    = cfg['paths']['data']
+    t_in_cpm    = cfg['time']['t_in_cpm']
+    t_in_met    = cfg['time']['t_in_met']
+    n_test      = cfg['data']['test_samples']
     if end is None:
         end = n_test
     if not (0 <= start < end <= n_test):
         raise ValueError(f"Invalid test slice [{start}, {end}) for n_test={n_test}")
     bs = end - start
 
+    use_pixel_norm = (
+        pixel_stats is not None
+        and cfg.get('data', {}).get('use_pixel_norm', False)
+    )
+
     base = {}
     for feat in features:
+        if feat == 'rain_mask':
+            rain_path = os.path.join(data_dir, 'test_in', 'rain.npy')
+            rain_arr = np.load(rain_path, mmap_mode='r')[start:end]
+            base[feat] = (rain_arr > 0).astype(np.float32)
+            continue
+
         path = os.path.join(data_dir, 'test_in', f'{feat}.npy')
         arr = np.load(path, mmap_mode='r')[start:end]
+
         if feat == 'cpm25':
-            pad = np.zeros((bs, t_in_met - t_in_cpm, 140, 124), dtype=np.float32)
-            arr = np.concatenate([arr, pad], axis=1)
-        base[feat] = normalize(arr, *bounds[feat])
+            if use_pixel_norm:
+                cpm_proc = preprocess_feature_pixelwise(arr, feat, pixel_stats)
+            else:
+                # Standard min-max log1p normalization - matches SlidingWindowTensorDataset
+                cpm_proc = preprocess_feature(arr, feat, bounds, month=None)
+            # Fill unknown future cpm25 hours (t_in_cpm:) with ZEROS.
+            n_fill  = t_in_met - t_in_cpm
+            zeros   = np.zeros((bs, n_fill, *cpm_proc.shape[2:]), dtype=np.float32)
+            base[feat] = np.concatenate([cpm_proc, zeros], axis=1)
+            continue
+
+        if use_pixel_norm:
+            base[feat] = preprocess_feature_pixelwise(arr, feat, pixel_stats)
+        else:
+            base[feat] = preprocess_feature(arr, feat, bounds, month=None)
 
     sample_shape = next(iter(base.values())).shape
     N, T, H, W = sample_shape

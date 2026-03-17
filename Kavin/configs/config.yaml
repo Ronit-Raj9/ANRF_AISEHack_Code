@@ -1,0 +1,100 @@
+# ─────────────────────────────────────────────
+# PM2.5 Forecasting — Configuration
+# ─────────────────────────────────────────────
+
+paths:
+  # Kaggle paths (used when /kaggle exists)
+  data:       "/kaggle/input/datasets/khushisingh942004/aisehack"
+  temp:       "/kaggle/temp"
+  model_save: "/kaggle/temp/best_model.pt"
+  output:     "/kaggle/working/preds.npy"
+  # Local paths (auto-applied in config.py when not on Kaggle)
+  data_local: "/home/raj/Documents/CODING/Hackathon/ANRF_AISEHack_Code/aisehack-theme-2"
+
+features:
+  met:  ["u10", "v10", "pblh", "rain", "t2", "q2", "swdown", "psfc"]
+  emis: ["PM25", "NOx", "NH3", "NMVOC_e", "NMVOC_finn"]
+  aux:  ["lat", "lon", "hour_sin", "hour_cos", "doy_sin", "doy_cos"]
+  use_aux: false
+  add_masks: ["rain_mask"]
+  # Full feature list = ["cpm25"] + met + emis  →  16 features total
+
+time:
+  t_in: 16        # model input window size (fix for PINO)
+  t_in_cpm: 10    # cpm25 history hours available at test time
+  t_in_met: 26    # met/emis input window (10 past + 16 NWP forecast)
+  t_out:    16    # forecast horizon
+  stride_train: 2
+  stride_val:   4
+
+data:
+  months:      ["APRIL_16", "JULY_16", "OCT_16", "DEC_16"]
+  val_month:   "OCT_16"
+  val_split:   0.15
+  val_firewall_hours: 12
+  test_samples: 996
+  december_grid_sigma_norm: true
+  use_hotspot_climatology_channel: true
+
+# ── Persistence baseline (from EDA) — values in *normalized* [0,1] space ──
+persistence:
+  rmse_normalized: 0.0208   # avg RMSE at t+16
+  rmse_physical:   30.83    # µg/m³  (threshold model must beat)
+
+model:
+  type:    "simvpv2"
+  # U-Net settings
+  base_ch: 64
+  # TFNO2D settings (fallback)
+  width:   72
+  modes:   20
+  depth:   6
+  # Residual spatiotemporal U-Net settings
+  stem_ch: 48
+  dropout: 0.1
+  simvp_hidden: 96
+  simvp_spatial_layers: 3
+  simvp_temporal_layers: 4
+
+models:
+  simvpv2:
+    simvp_hidden: 96
+    simvp_spatial_layers: 3
+    simvp_temporal_layers: 4
+  tfno2d:
+    width: 72
+    modes: 20
+    depth: 6
+  unet:
+    base_ch: 64
+  res_stunet:
+    base_ch: 64
+    stem_ch: 48
+    dropout: 0.1
+
+training:
+  epochs:           20
+  patience:         20         # larger model needs longer runway
+  batch_size_train: 2
+  batch_size_val:   4
+  batch_size_test:  16
+  lr:               1.2e-3
+  weight_decay:     1.0e-4
+  pct_start:        0.2        # OneCycleLR warmup fraction
+  scheduler:        "onecycle"
+  t0_epochs:        20         # CosWR: smoother first cycle for fewer restart spikes
+  t_mult:           1          # keep cycle length fixed for steadier late training
+  grad_clip:        0.8
+  num_workers:      2
+  pin_memory:       true
+  seed:             42
+  lambda_d: 1.0
+  lambda_p: 0.02
+  physics_warmup_epochs: 25
+
+loss:
+  use_spatial_hotspot_weight: true
+  horizon_weight_min: 0.8
+  horizon_weight_max: 1.4
+  rmse_weight: 0.8
+  mae_weight: 0.2

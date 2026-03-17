@@ -14,7 +14,7 @@ import os
 import numpy as np
 import torch
 
-from .data import build_test_input, denormalize
+from .data import build_test_input, denormalize, get_hotspot_maps
 
 
 def _add_engineered_test_features(x_batch: np.ndarray, cfg: dict) -> np.ndarray:
@@ -29,7 +29,7 @@ def _add_engineered_test_features(x_batch: np.ndarray, cfg: dict) -> np.ndarray:
     Returns
     -------
     np.ndarray
-        Shape (B, C+12, T, H, W), matching training-time engineered channels.
+        Shape (B, C+11, T, H, W), matching training-time engineered channels.
     """
     x = np.asarray(x_batch, dtype=np.float32)
     B, C, T, H, W = x.shape
@@ -75,14 +75,8 @@ def _add_engineered_test_features(x_batch: np.ndarray, cfg: dict) -> np.ndarray:
     month_sin = np.broadcast_to(month_sin, (B, T, H, W))
     month_cos = np.broadcast_to(month_cos, (B, T, H, W))
 
-    lat_long_path = os.path.join(cfg['paths']['data'], 'raw', 'lat_long.npy')
-    lat_long = np.load(lat_long_path).astype(np.float32)
-    lat = lat_long[:, :, 0]
-    lon = lat_long[:, :, 1]
-    lat = (lat - lat.min()) / (lat.max() - lat.min() + np.float32(1e-8))
-    lon = (lon - lon.min()) / (lon.max() - lon.min() + np.float32(1e-8))
-    lat = np.broadcast_to(lat.reshape(1, 1, H, W), (B, T, H, W))
-    lon = np.broadcast_to(lon.reshape(1, 1, H, W), (B, T, H, W))
+    hotspot_prior, _ = get_hotspot_maps(cfg)
+    hotspot = np.broadcast_to(hotspot_prior.reshape(1, 1, H, W), (B, T, H, W)).astype(np.float32)
 
     lag_1 = np.roll(cpm25, 1, axis=1)
     lag_3 = np.roll(cpm25, 3, axis=1)
@@ -91,7 +85,7 @@ def _add_engineered_test_features(x_batch: np.ndarray, cfg: dict) -> np.ndarray:
     engineered = np.stack([
         wind_speed, wind_dir, rh,
         hour_sin, hour_cos, month_sin, month_cos,
-        lat, lon, lag_1, lag_3, lag_6,
+        hotspot, lag_1, lag_3, lag_6,
     ], axis=1).astype(np.float32)
 
     out = np.concatenate([x, engineered], axis=1).astype(np.float32)
