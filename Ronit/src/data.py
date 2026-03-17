@@ -20,7 +20,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler, random_split
 
 
 FALLBACK_OFFICIAL_BOUNDS = {
@@ -49,6 +49,116 @@ DEFAULT_SPARSE_MASK_FEATURES = {'rain', 'NMVOC_finn'}
 DEFAULT_AUX_STANDARDIZE = {'ventilation_index', 'wind_convergence'}
 
 _SCALER_META_VERSION = 2
+
+
+class SlidingWindowTensorDataset(Dataset):
+    """Baseline-compatible sliding-window dataset over `(N, C, T, H, W)` tensors."""
+
+    def __init__(self, tensor, window_size, t_out, target_channel=0):
+        self.tensor = tensor
+        self.window_size = window_size
+        self.t_out = t_out
+        self.target_channel = target_channel
+        self.N, self.C, self.T, self.H, self.W = tensor.shape
+        self.num_windows = self.T - window_size - t_out + 1
+        if self.num_windows <= 0:
+            raise ValueError(
+                f"Not enough time steps for sliding windows: T={self.T}, "
+                f"t_in={window_size}, t_out={t_out}."
+            )
+        self.total = self.N * self.num_windows
+
+    def __len__(self):
+        return self.total
+
+    def __getitem__(self, idx):
+        n = idx // self.num_windows
+        w = idx % self.num_windows
+        xb = self.tensor[n, :, w:w + self.window_size, :, :]
+        y_start = w + self.window_size
+        y_end = y_start + self.t_out
+        yb = self.tensor[n, self.target_channel, y_start:y_end, :, :]
+        xb = torch.tensor(xb, dtype=torch.float32)
+        yb = torch.tensor(yb, dtype=torch.float32).permute(1, 2, 0)
+        return xb, yb
+
+
+def add_physical_features(tensor, features_dict=None, lat_long_path='lat_long.npy'):
+    """
+    Add 12 engineered PINO channels:
+    wind_speed, wind_dir, RH, hour_sin, hour_cos, month_sin, month_cos,
+    lat, lon, lag_1, lag_3, lag_6
+    """
+    tensor = np.asarray(tensor, dtype=np.float32)
+    N, C, T, H, W = tensor.shape
+    N_ENG = 12
+
+    out = np.empty((N, C + N_ENG, T, H, W), dtype=np.float32)
+    out[:, :C] = tensor
+    ch = C
+
+    u10 = tensor[:, features_dict['u10'], :, :, :]
+    v10 = tensor[:, features_dict['v10'], :, :, :]
+    out[:, ch] = np.sqrt(u10 ** 2 + v10 ** 2)
+    ch += 1
+    out[:, ch] = np.arctan2(v10, u10)
+    ch += 1
+    del u10, v10
+    gc.collect()
+
+    t2 = tensor[:, features_dict['t2'], :, :, :].copy().astype(np.float32)
+    q2 = tensor[:, features_dict['q2'], :, :, :].copy().astype(np.float32)
+    denom_safe = np.where(
+        np.abs(t2 - 29.65) < 1e-3,
+        np.sign(t2 - 29.65 + np.float32(1e-3)) * np.float32(1e-3),
+        t2 - np.float32(29.65),
+    ).astype(np.float32)
+    exponent = np.clip(
+        np.float32(17.67) * (t2 - np.float32(273.15)) / denom_safe,
+        np.float32(-100.0), np.float32(100.0)
+    )
+    rh = q2 / (np.float32(0.622) + np.float32(0.378) * q2 + np.float32(1e-8)) * np.exp(exponent)
+    out[:, ch] = np.clip(rh, np.float32(0.0), np.float32(1.5))
+    ch += 1
+    del t2, q2, denom_safe, exponent, rh
+    gc.collect()
+
+    hour = (np.arange(T, dtype=np.float32) % 24)
+    for vals in [
+        np.sin(np.float32(2 * np.pi) * hour / np.float32(24)),
+        np.cos(np.float32(2 * np.pi) * hour / np.float32(24)),
+        np.full(T, np.sin(np.float32(2 * np.pi / 12)), dtype=np.float32),
+        np.full(T, np.cos(np.float32(2 * np.pi / 12)), dtype=np.float32),
+    ]:
+        out[:, ch] = vals.reshape(1, T, 1, 1)
+        ch += 1
+    del hour
+    gc.collect()
+
+    ll = np.load(lat_long_path).astype(np.float32)
+    lat = ll[:, :, 0]
+    lon = ll[:, :, 1]
+    lat = (lat - lat.min()) / (lat.max() - lat.min() + np.float32(1e-8))
+    lon = (lon - lon.min()) / (lon.max() - lon.min() + np.float32(1e-8))
+    out[:, ch] = lat.reshape(1, 1, H, W)
+    ch += 1
+    out[:, ch] = lon.reshape(1, 1, H, W)
+    ch += 1
+    del ll, lat, lon
+    gc.collect()
+
+    cpm25 = tensor[:, features_dict['cpm25'], :, :, :].copy()
+    out[:, ch] = np.roll(cpm25, 1, axis=1)
+    ch += 1
+    out[:, ch] = np.roll(cpm25, 3, axis=1)
+    ch += 1
+    out[:, ch] = np.roll(cpm25, 6, axis=1)
+    ch += 1
+    del cpm25
+    gc.collect()
+
+    np.nan_to_num(out, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    return out
 
 
 def _prep_cfg(cfg: dict) -> dict:
@@ -257,6 +367,35 @@ def load_static_maps(cfg) -> dict:
     lat = (lat - lat.min()) / (lat.max() - lat.min() + 1e-8)
     lon = (lon - lon.min()) / (lon.max() - lon.min() + 1e-8)
     return {'lat': lat.astype(np.float32), 'lon': lon.astype(np.float32)}
+
+
+def build_aux_feature_maps(cfg, time_arr: np.ndarray | None, T: int, H: int, W: int) -> dict:
+    """Baseline-compatible helper to build calendar/static aux maps."""
+    aux_names = cfg.get('features', {}).get('aux', [])
+    static = load_static_maps(cfg)
+    aux = {}
+
+    if 'lat' in aux_names:
+        aux['lat'] = np.broadcast_to(static['lat'][None], (T, H, W)).copy()
+    if 'lon' in aux_names:
+        aux['lon'] = np.broadcast_to(static['lon'][None], (T, H, W)).copy()
+
+    if time_arr is None:
+        hours = np.zeros(T, dtype=np.float32)
+        doys = np.ones(T, dtype=np.float32)
+    else:
+        hours, doys = _parse_time_strings(time_arr)
+
+    if 'hour_sin' in aux_names:
+        aux['hour_sin'] = _broadcast_scalar_series(np.sin(2 * np.pi * hours / 24.0), H, W)
+    if 'hour_cos' in aux_names:
+        aux['hour_cos'] = _broadcast_scalar_series(np.cos(2 * np.pi * hours / 24.0), H, W)
+    if 'doy_sin' in aux_names:
+        aux['doy_sin'] = _broadcast_scalar_series(np.sin(2 * np.pi * doys / 366.0), H, W)
+    if 'doy_cos' in aux_names:
+        aux['doy_cos'] = _broadcast_scalar_series(np.cos(2 * np.pi * doys / 366.0), H, W)
+
+    return aux
 
 
 def load_land_mask(cfg, H: int, W: int) -> np.ndarray:
@@ -964,3 +1103,30 @@ def save_stats(stats, path):
 
 def load_stats(path):
     return np.load(path, allow_pickle=True).item()
+
+
+def make_dataloaders(cfg, tensor, bounds):
+    """
+    Baseline-compatible window-level random split dataloaders for PINO notebooks.
+    This complements `get_dataloaders` and keeps Ronit's advanced pipeline intact.
+    """
+    batch_size = cfg['training']['batch_size_train']
+    val_batch_size = cfg['training'].get('batch_size_val', batch_size)
+    window_size = cfg['time']['t_in']
+    t_out = cfg['time']['t_out']
+    val_split = cfg['data'].get('val_split', 0.1)
+
+    full_ds = SlidingWindowTensorDataset(tensor, window_size, t_out=t_out, target_channel=0)
+    n_total = len(full_ds)
+    n_val = max(1, int(n_total * val_split))
+    n_train = n_total - n_val
+    if n_train <= 0:
+        raise ValueError(f"Invalid val_split={val_split}; not enough windows for training.")
+
+    seed = cfg.get('training', {}).get('seed', 42)
+    generator = torch.Generator().manual_seed(seed)
+    train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=generator)
+
+    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_dl = DataLoader(val_ds, batch_size=val_batch_size, shuffle=False)
+    return train_dl, val_dl

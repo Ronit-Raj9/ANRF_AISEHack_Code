@@ -5,8 +5,8 @@
 paths:
   # Kaggle paths (used when /kaggle exists)
   data: "/kaggle/input/datasets/khushisingh942004/aisehack"
-  temp: "/kaggle/temp"
-  model_save: "/kaggle/temp/best_model.pt"
+  temp: "/kaggle/working"
+  model_save: "/kaggle/working/best_model.pt"
   checkpoint_dir: "/kaggle/working"
   checkpoint_last: "/kaggle/working/last_checkpoint.pt"
   output: "/kaggle/working/preds.npy"
@@ -14,13 +14,12 @@ paths:
   data_local: "/home/raj/Documents/CODING/Hackathon/ANRF_AISEHack_Code/aisehack-theme-2"
 
 features:
-  met: ["u10", "v10", "pblh", "rain", "t2", "q2", "swdown", "psfc"]
-  emis: ["PM25", "SO2", "NOx", "NH3", "NMVOC_e", "NMVOC_finn", "bio"]
-  aux: ["lat", "lon", "hour_sin", "hour_cos", "doy_sin", "doy_cos"]
-  use_aux: false
+  met: ["pblh", "t2", "u10", "v10", "q2", "rain"]
+  emis: ["PM25", "NOx", "NH3"]
+  aux: ["hour_sin", "hour_cos", "rain_mask", "NMVOC_finn_mask"]
+  use_aux: true
 
 time:
-  t_in: 16 # model input window size (fix for PINO)
   t_in_cpm: 10 # cpm25 history hours available at test time
   t_in_met: 26 # met/emis input window (10 past + 16 NWP forecast)
   t_out: 16 # forecast horizon
@@ -29,8 +28,7 @@ time:
 
 data:
   months: ["APRIL_16", "JULY_16", "OCT_16", "DEC_16"]
-  val_month: "OCT_16"
-  val_split: 0.15
+  val_month: "DEC_16"
   val_tail_fraction: 0.2
   test_samples: 996
 
@@ -65,27 +63,21 @@ persistence:
   rmse_physical: 30.83 # µg/m³  (threshold model must beat)
 
 model:
-  type: "tfno2d"
-  base_ch: 64
-  width: 32
-  modes: 12
-  depth: 3
-  stem_ch: 48
-  dropout: 0.1
+  type: "physics_frno"
+  width: 64
+  modes: 20
+  depth: 6
   rank_ratio: 0.4
   alpha_init: 0.35
+  dropout: 0.05
 
 models:
   tfno2d:
-    width: 32
-    modes: 12
-    depth: 3
+    width: 64
+    modes: 20
+    depth: 6
   unet:
     base_ch: 64
-  res_stunet:
-    base_ch: 64
-    stem_ch: 48
-    dropout: 0.1
   physics_frno:
     width: 64
     modes: 20
@@ -98,24 +90,21 @@ training:
   phase1_epochs: 20
   phase2_epochs: 20
   phase3_epochs: 10
-  epochs: 80
-  patience: 12
+  epochs: 50
+  patience: 15
   batch_size_train: 4
   batch_size_val: 8
   batch_size_test: 16
-  lr: 6.0e-4
-  weight_decay: 5.0e-3
-  pct_start: 0.1 # OneCycleLR warmup fraction (unused by coswr)
-  scheduler: "coswr"
-  t0_epochs: 10
-  t_mult: 2
+  lr: 5.0e-4
+  weight_decay: 2.0e-4
+  pct_start: 0.15 # OneCycleLR warmup fraction
   grad_clip: 1.0
   num_workers: 2
   pin_memory: true
   seed: 42
   use_amp: false
   lambda_d: 1.0
-  lambda_p: 0.1
+  lambda_p: 0.02
   use_weighted_sampler: true
   default_sampling_weight: 1.0
   checkpoint_metric: val_rmse_phys
@@ -132,10 +121,6 @@ training:
     DEC_16: 3.0
 
 loss:
-  horizon_weight_min: 0.8
-  horizon_weight_max: 1.4
-  rmse_weight: 0.8
-  mae_weight: 0.2
   type: three_phase
   intensity_ref: 59.1
 

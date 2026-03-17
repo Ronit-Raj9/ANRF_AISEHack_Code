@@ -10,6 +10,7 @@ except ImportError:
     _wandb = None
     _WANDB_AVAILABLE = False
 
+PERSISTENCE_RMSE_NORM = 0.0208
 PERSISTENCE_RMSE_PHYS = 30.83  # µg/m³
 
 def _checkpoint_enabled(cfg: dict) -> bool:
@@ -73,8 +74,99 @@ def finish_wandb(run, history: dict, bounds: dict, cfg: dict):
         run.summary['best_val_rmse_std'] = history['val_loss'][best_idx]
     run.finish()
 
-def rmse_loss(pred, target):
-    return torch.mean(torch.sqrt(torch.mean((pred - target) ** 2, dim=(1, 2)) + 1e-8))
+def _horizon_weights(cfg, target: torch.Tensor) -> torch.Tensor:
+    t_out = target.shape[-1]
+    lo = cfg.get('loss', {}).get('horizon_weight_min', 0.8)
+    hi = cfg.get('loss', {}).get('horizon_weight_max', 1.4)
+    return torch.linspace(lo, hi, t_out, device=target.device, dtype=target.dtype)
+
+
+def rmse_loss(pred, target, cfg: dict | None = None):
+    spatial_mse = torch.mean((pred - target) ** 2, dim=(1, 2))
+    if cfg is not None:
+        weights = _horizon_weights(cfg, target)[None]
+        spatial_mse = spatial_mse * weights
+    return torch.mean(torch.sqrt(spatial_mse + 1e-8))
+
+
+def rmse_loss_plain(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    spatial_mse = torch.mean((pred - target) ** 2, dim=(1, 2))
+    return torch.mean(torch.sqrt(spatial_mse + 1e-8))
+
+
+def mae_loss(pred: torch.Tensor, target: torch.Tensor, cfg: dict | None = None) -> torch.Tensor:
+    spatial_mae = torch.mean(torch.abs(pred - target), dim=(1, 2))
+    if cfg is not None:
+        weights = _horizon_weights(cfg, target)[None]
+        spatial_mae = spatial_mae * weights
+    return torch.mean(spatial_mae)
+
+
+def objective_loss(pred: torch.Tensor, target: torch.Tensor, cfg: dict) -> torch.Tensor:
+    wrmse = rmse_loss(pred, target, cfg)
+    wmae = mae_loss(pred, target, cfg)
+    a = cfg.get('loss', {}).get('rmse_weight', 0.8)
+    b = cfg.get('loss', {}).get('mae_weight', 0.2)
+    return a * wrmse + b * wmae
+
+
+def compute_physics_loss(pred, xb, yb, cfg):
+    if pred.ndim != 4:
+        return torch.zeros((), device=pred.device, dtype=pred.dtype)
+
+    dt = 1.0
+    last_c = xb[:, 0, -1, :, :].unsqueeze(-1)
+    dC_dt = (pred - last_c) / dt
+
+    grad_h = torch.gradient(pred, dim=1)[0]
+    grad_w = torch.gradient(pred, dim=2)[0]
+
+    feature_names = cfg.get('features', {}).get('all', [])
+
+    def _feat_idx(name: str):
+        if name in feature_names:
+            idx = feature_names.index(name)
+            if idx < xb.shape[1]:
+                return idx
+        return None
+
+    u_idx = _feat_idx('u10')
+    v_idx = _feat_idx('v10')
+    if u_idx is None or v_idx is None:
+        advection = torch.zeros_like(pred)
+    else:
+        u = xb[:, u_idx, -1, :, :].unsqueeze(-1)
+        v = xb[:, v_idx, -1, :, :].unsqueeze(-1)
+        advection = u * grad_h + v * grad_w
+
+    kappa = cfg.get('physics', {}).get('diffusivity', 1.0)
+    laplacian = torch.gradient(grad_h, dim=1)[0] + torch.gradient(grad_w, dim=2)[0]
+    diffusion = kappa * laplacian
+
+    S = torch.zeros_like(pred)
+    for name in ('SO2', 'NOx', 'PM25', 'cpm25'):
+        idx = _feat_idx(name)
+        if idx is not None:
+            S = S + xb[:, idx, -1, :, :].unsqueeze(-1)
+
+    R = dC_dt + advection - diffusion - S
+    return torch.mean(R ** 2)
+
+
+def check_persistence_gate(val_rmse: float, epoch: int) -> None:
+    gap = val_rmse - PERSISTENCE_RMSE_NORM
+    if gap > 0:
+        print(
+            f"  ⚠  Persistence gate NOT met at epoch {epoch}: "
+            f"val_rmse={val_rmse:.4f}  >  persistence={PERSISTENCE_RMSE_NORM:.4f} "
+            f"(gap={gap:+.4f})"
+        )
+    else:
+        print(
+            f"  ✓  Persistence gate MET: "
+            f"val_rmse={val_rmse:.4f}  <  persistence={PERSISTENCE_RMSE_NORM:.4f} "
+            f"(gap={gap:+.4f})"
+        )
 
 def _grid_stats_tensors(cfg: dict, device, dtype):
     stats = cfg.get('_runtime', {}).get('grid_stats')
